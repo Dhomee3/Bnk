@@ -296,11 +296,11 @@ client.once("clientReady", async (readyClient) => {
   readyClient.user.setPresence({
     activities: [
       {
-        name: " Powred By FTRP  .",
+        name: "Powered By FTRP .",
         type: ActivityType.Streaming,
       },
     ],
-    status: "idle",
+    status: "online",
   });
 
   const token = process.env.DISCORD_BOT_TOKEN!;
