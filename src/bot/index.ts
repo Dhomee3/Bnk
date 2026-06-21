@@ -42,6 +42,8 @@ import {
   setAccountBalance,
   removeBalance,
   payRoleSalaries,
+  paySalaries,
+  saveDB,
   logRobbery,
   getRobberyLogs,
   deleteAccount,
@@ -53,6 +55,15 @@ import {
   addWeaponActivation,
   updateWeaponActivation,
   getWeaponActivation,
+  issueViolation,
+  getUnpaidViolationsByUserId,
+  getViolationsByUserId,
+  payViolation,
+  payAllViolations,
+  markExpiredViolations,
+  cancelViolation,
+  getAllViolations,
+  formatIBAN,
 } from "./database.js";
 
 // ─── جدول الرواتب بالرتب ─────────────────────
@@ -285,7 +296,7 @@ client.once("clientReady", async (readyClient) => {
   readyClient.user.setPresence({
     activities: [
       {
-        name: "Powered By FTRP .",
+        name: "Powered By M7md .",
         type: ActivityType.Playing,
       },
     ],
@@ -328,26 +339,8 @@ function setupCronJobs() {
     ) as TextChannel;
     if (!channel) return;
 
-    // احسب الرواتب حسب الرتب
-    const salaryList: { userId: string; amount: number; roleName: string }[] =
-      [];
-    for (const [, guild] of client.guilds.cache) {
-      const members = await guild.members.fetch().catch(() => null);
-      if (!members) continue;
-      for (const [, gm] of members) {
-        if (gm.user.bot) continue;
-        const roleIds = gm.roles.cache.map((r: any) => r.id);
-        const best = getHighestSalaryForMember(roleIds);
-        if (best)
-          salaryList.push({
-            userId: gm.user.id,
-            amount: best.amount,
-            roleName: best.name,
-          });
-      }
-    }
-
-    const result = payRoleSalaries(salaryList, "auto-cron");
+    // صرف رواتب الموظفين حسب راتب كل حساب
+    const result = paySalaries("auto-cron");
     updateSettings({ lastSalaryWeek: getCurrentWeekId() } as any);
     const e = embed(DARK_BLUE)
       .setTitle("💰 تم صرف الرواتب التلقائي")
@@ -356,13 +349,18 @@ function setupCronJobs() {
         { name: "عدد الموظفين", value: `${result.count}`, inline: true },
         {
           name: "إجمالي المبلغ",
-          value: `${result.paid.toLocaleString()} ريال`,
+          value: `${result.paid.toLocaleString("en-US")} ريال`,
           inline: true,
         },
       )
       .setTimestamp()
       .setFooter({ text: "نظام الرواتب التلقائي" });
     await channel.send({ content: "@everyone", embeds: [e] });
+  });
+
+  cron.schedule("0 * * * *", () => {
+    const evaded = markExpiredViolations();
+    if (evaded > 0) console.log(`⚠️ تم تسجيل ${evaded} مخالفة كمتهرب (انتهت 24 ساعة)`);
   });
 }
 
@@ -390,6 +388,7 @@ async function sendMainPanel(channel: TextChannel) {
       new StringSelectMenuOptionBuilder().setLabel("سحب بنك → كاش").setValue("withdraw_btn").setDescription("تحويل رصيد بنكي إلى كاش").setEmoji("💵"),
       new StringSelectMenuOptionBuilder().setLabel("تحويل أموال").setValue("transfer_btn").setDescription("تحويل مبلغ لحساب آخر").setEmoji("💸"),
       new StringSelectMenuOptionBuilder().setLabel("سجل المعاملات").setValue("my_transactions").setDescription("عرض آخر معاملاتك").setEmoji("📋"),
+      new StringSelectMenuOptionBuilder().setLabel("تسديد مخالفة").setValue("pay_violation").setDescription("عرض مخالفاتك وتسديدها").setEmoji("🚨"),
       new StringSelectMenuOptionBuilder().setLabel("لوحة الإدارة").setValue("admin_panel").setDescription("للمسؤولين فقط").setEmoji("🔧"),
     );
 
@@ -410,6 +409,7 @@ async function sendAdminPanel(channel: TextChannel) {
       { name: "➖ إزالة مال", value: "خصم مبلغ من حساب معين", inline: true },
       { name: "📜 كل السجلات", value: "عرض آخر المعاملات", inline: true },
       { name: "⚙️ الإعدادات", value: "ضبط القنوات وقنوات اللوق", inline: true },
+      { name: "🚨 تحرير مخالفة", value: "إصدار مخالفة مالية على مواطن", inline: true },
     )
     .setTimestamp()
     .setFooter({ text: "لوحة الإدارة" });
@@ -430,6 +430,9 @@ async function sendAdminPanel(channel: TextChannel) {
       new StringSelectMenuOptionBuilder().setLabel("كل السجلات").setValue("admin_all_transactions").setDescription("عرض آخر المعاملات في النظام").setEmoji("📑"),
       new StringSelectMenuOptionBuilder().setLabel("تسجيل سرقة").setValue("admin_robbery").setDescription("تسجيل سرقة").setEmoji("🥷"),
       new StringSelectMenuOptionBuilder().setLabel("سجل السرقات").setValue("admin_robbery_logs").setDescription("عرض آخر السرقات المسجّلة").setEmoji("💱"),
+      new StringSelectMenuOptionBuilder().setLabel("تحرير مخالفة").setValue("admin_issue_violation").setDescription("إصدار مخالفة مالية على مواطن").setEmoji("🚨"),
+      new StringSelectMenuOptionBuilder().setLabel("سجل المخالفات").setValue("admin_violations_log").setDescription("عرض جميع المخالفات وحالتها").setEmoji("📋"),
+      new StringSelectMenuOptionBuilder().setLabel("إلغاء مخالفة").setValue("admin_cancel_violation").setDescription("إلغاء مخالفة برقمها").setEmoji("❌"),
       new StringSelectMenuOptionBuilder().setLabel("الإعدادات").setValue("admin_settings").setDescription("ضبط القنوات وقنوات اللوق").setEmoji("⚙️"),
     );
 
@@ -443,6 +446,9 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
   const { commandName, user, member, channel } = interaction;
 
   if (commandName === "panel") {
+    const m = member as GuildMember;
+    if (!isAdmin(m))
+      return interaction.reply({ content: "❌ هذا الأمر للإدارة فقط.", ephemeral: true });
     await sendMainPanel(channel as TextChannel);
     return interaction.reply({
       content: "✅  تم إرسال اللوحة بنجاح.",
@@ -466,6 +472,9 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
   }
 
   if (commandName === "حساب" || commandName === "رصيد") {
+    const m = member as GuildMember;
+    if (!isAdmin(m))
+      return interaction.reply({ content: "❌ هذا الأمر للإدارة فقط.", ephemeral: true });
     const account = getAccountByUserId(user.id);
     if (!account) {
       return interaction.reply({
@@ -482,19 +491,22 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
     const e = embed(account.frozen ? RED : DARK_BLUE)
       .setTitle("💳 معلومات حسابك")
       .addFields(
-        { name: "رقم الحساب", value: `**${account.id}**`, inline: true },
-        { name: "💵 كاش", value: `**${slashCash.toLocaleString()} ريال**`, inline: true },
-        { name: "🏦 رصيد البنك", value: `**${account.balance.toLocaleString()} ريال**`, inline: true },
-        { name: "💰 الإجمالي", value: `**${slashTotal.toLocaleString()} ريال**`, inline: true },
-        { name: "الراتب الأسبوعي", value: `**${account.salary.toLocaleString()} ريال**`, inline: true },
+        { name: "رقم الحساب", value: `**${formatIBAN(account.id)}**`, inline: true },
+        { name: "💵 كاش", value: `**${slashCash.toLocaleString("en-US")} ريال**`, inline: true },
+        { name: "🏦 رصيد البنك", value: `**${account.balance.toLocaleString("en-US")} ريال**`, inline: true },
+        { name: "💰 الإجمالي", value: `**${slashTotal.toLocaleString("en-US")} ريال**`, inline: true },
+        { name: "الراتب الأسبوعي", value: `**${account.salary.toLocaleString("en-US")} ريال**`, inline: true },
         { name: "الحالة", value: account.frozen ? "🔴 مجمّد" : "🟢 نشط", inline: true },
-        { name: "تاريخ الإنشاء", value: new Date(account.createdAt).toLocaleDateString("ar-SA"), inline: true },
+        { name: "تاريخ الإنشاء", value: new Date(account.createdAt).toLocaleDateString("en-GB"), inline: true },
       )
       .setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] });
   }
 
   if (commandName === "سجلات") {
+    const m = member as GuildMember;
+    if (!isAdmin(m))
+      return interaction.reply({ content: "❌ هذا الأمر للإدارة فقط.", ephemeral: true });
     const account = getAccountByUserId(user.id);
     if (!account)
       return interaction.reply({
@@ -510,15 +522,18 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
           : txs
               .map(
                 (t) =>
-                  `• ${t.description}\n  🕒 ${new Date(t.timestamp).toLocaleString("ar-SA")}`,
+                  `• ${t.description}\n  🕒 ${new Date(t.timestamp).toLocaleString("en-US")}`,
               )
               .join("\n\n"),
       )
       .setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] });
   }
 
   if (commandName === "تحويل") {
+    const m = member as GuildMember;
+    if (!isAdmin(m))
+      return interaction.reply({ content: "❌ هذا الأمر للإدارة فقط.", ephemeral: true });
     const toAccountId = interaction.options.getString("رقم_الحساب", true).trim();
     const amount = interaction.options.getInteger("المبلغ", true);
     const pinInput = interaction.options.getString("pin", true).trim();
@@ -548,8 +563,8 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
             .setTitle("💸 وصلك تحويل!")
             .addFields(
               { name: "من", value: `<@${user.id}>`, inline: true },
-              { name: "المبلغ", value: `**${amount.toLocaleString()} ريال**`, inline: true },
-              { name: "رصيدك الجديد", value: `${toAccount.balance.toLocaleString()} ريال`, inline: true },
+              { name: "المبلغ", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
+              { name: "رصيدك الجديد", value: `${toAccount.balance.toLocaleString("en-US")} ريال`, inline: true },
             )
             .setTimestamp()
           ],
@@ -562,8 +577,8 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
         .addFields(
           { name: "من حساب", value: `**${fromAccount.id}**`, inline: true },
           { name: "إلى حساب", value: `**${toAccountId}**`, inline: true },
-          { name: "المبلغ", value: `**${amount.toLocaleString()} ريال**`, inline: true },
-          { name: "رصيدك الجديد", value: `${updatedFrom?.balance.toLocaleString()} ريال`, inline: true },
+          { name: "المبلغ", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
+          { name: "رصيدك الجديد", value: `${updatedFrom?.balance.toLocaleString("en-US")} ريال`, inline: true },
         )
         .setTimestamp(),
       ],
@@ -571,7 +586,10 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  if (commandName === "gun-panel") {
+  if (commandName === "gun-panel" || commandName === "اسلحة") {
+    const m = member as GuildMember;
+    if (!isAdmin(m))
+      return interaction.reply({ content: "❌ هذا الأمر للإدارة فقط.", ephemeral: true });
     const account = getAccountByUserId(user.id);
     if (!account)
       return interaction.reply({ content: "❌ لا يوجد لديك حساب بنكي.", ephemeral: true });
@@ -581,7 +599,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
       .addOptions(
         ...Object.entries(WEAPON_ITEMS).map(([key, item]) =>
           new StringSelectMenuOptionBuilder()
-            .setLabel(`${item.name} — ${item.price.toLocaleString()}$`)
+            .setLabel(`${item.name} — ${item.price.toLocaleString("en-US")}$`)
             .setValue(`wresource_${key}`)
             .setDescription(item.desc.slice(0, 100))
             .setEmoji(item.emoji)
@@ -594,20 +612,20 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
       );
     const db = getDB();
     const stockLines = Object.entries(WEAPON_ITEMS)
-      .map(([k, v]) => `${v.emoji} **${v.name}** — ${v.price.toLocaleString()}$  |  مخزون: ${(db.weaponStock ?? {})[k] ?? 0}`)
+      .map(([k, v]) => `${v.emoji} **${v.name}** — ${v.price.toLocaleString("en-US")}$  |  مخزون: ${(db.weaponStock ?? {})[k] ?? 0}`)
       .join("\n");
     const e = embed(DARK_BLUE)
       .setTitle("⚔️ نظام الأسلحة والموارد")
       .setDescription("اختر موردًا لعرض تفاصيله وشرائه، أو استعرض خزنتك وقائمة الأسلحة.\n\n" + stockLines)
       .setTimestamp();
-    return interaction.reply({
+    await (channel as TextChannel).send({
       embeds: [e],
       components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
-      ephemeral: true,
     });
+    return interaction.reply({ content: "✅ تم إرسال لوحة الأسلحة.", ephemeral: true });
   }
 
-  if (commandName === "gun-admin") {
+  if (commandName === "gun-admin" || commandName === "اسلحة-ادمن") {
     const m = member as GuildMember;
     if (!isAdmin(m))
       return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
@@ -630,11 +648,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
       .setTitle("🔧 إدارة نظام الأسلحة")
       .setDescription("اختر إجراءً من القائمة أدناه.")
       .setTimestamp();
-    return interaction.reply({
+    await (channel as TextChannel).send({
       embeds: [e],
       components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
-      ephemeral: true,
     });
+    return interaction.reply({ content: "✅ تم إرسال لوحة إدارة الأسلحة.", ephemeral: true });
   }
 }
 
@@ -676,7 +694,7 @@ async function handleButton(interaction: any) {
           embed(DARK_BLUE)
             .setTitle("❌ لديك حساب بالفعل")
             .setDescription(
-              `رقم حسابك: **${existing.id}**\nرصيدك: **${existing.balance.toLocaleString()} ريال**`,
+              `رقم حسابك: **${existing.id}**\nرصيدك: **${existing.balance.toLocaleString("en-US")} ريال**`,
             ),
         ],
         ephemeral: true,
@@ -718,7 +736,7 @@ async function handleButton(interaction: any) {
           .setRequired(true)
           .setMinLength(4)
           .setMaxLength(4)
-          .setPlaceholder("اكتب الإيبان الخاص بك مكون من 4 ارقام"),
+          .setPlaceholder("مثال: 7491 1342"),
       ),
     );
     return interaction.showModal(modal);
@@ -737,16 +755,17 @@ async function handleButton(interaction: any) {
     const e = embed(account.frozen ? RED : DARK_BLUE)
       .setTitle("💳 معلومات حسابك")
       .addFields(
-        { name: "رقم الحساب", value: `**${account.id}**`, inline: true },
-        { name: "💵 كاش", value: `**${cash.toLocaleString()} ريال**`, inline: true },
-        { name: "🏦 رصيد البنك", value: `**${account.balance.toLocaleString()} ريال**`, inline: true },
-        { name: "💰 الإجمالي", value: `**${total.toLocaleString()} ريال**`, inline: true },
-        { name: "الراتب الأسبوعي", value: `**${account.salary.toLocaleString()} ريال**`, inline: true },
+        { name: "رقم الحساب", value: `**${formatIBAN(account.id)}**`, inline: true },
+        { name: "🔑 رمز PIN", value: `**${account.pin}**`, inline: true },
+        { name: "💵 كاش", value: `**${cash.toLocaleString("en-US")} ريال**`, inline: true },
+        { name: "🏦 رصيد البنك", value: `**${account.balance.toLocaleString("en-US")} ريال**`, inline: true },
+        { name: "💰 الإجمالي", value: `**${total.toLocaleString("en-US")} ريال**`, inline: true },
+        { name: "الراتب الأسبوعي", value: `**${account.salary.toLocaleString("en-US")} ريال**`, inline: true },
         { name: "الحالة", value: account.frozen ? "🔴 مجمّد" : "🟢 نشط", inline: true },
-        { name: "تاريخ الإنشاء", value: new Date(account.createdAt).toLocaleDateString("ar-SA"), inline: true },
+        { name: "تاريخ الإنشاء", value: new Date(account.createdAt).toLocaleDateString("en-GB"), inline: true },
       )
       .setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] , ephemeral: true });
   }
 
   if (customId === "deposit_btn") {
@@ -760,7 +779,7 @@ async function handleButton(interaction: any) {
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
           .setCustomId("amount")
-          .setLabel(`الكاش المتاح: ${(account.cash ?? 0).toLocaleString()} ريال — المبلغ المراد إيداعه`)
+          .setLabel(`الكاش المتاح: ${(account.cash ?? 0).toLocaleString("en-US")} ريال — المبلغ المراد إيداعه`)
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
           .setPlaceholder("المبلغ المراد إيداعه الى البنك"),
@@ -780,7 +799,7 @@ async function handleButton(interaction: any) {
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
           .setCustomId("amount")
-          .setLabel(`رصيد البنك: ${account.balance.toLocaleString()} ريال — المبلغ المراد سحبه`)
+          .setLabel(`رصيد البنك: ${account.balance.toLocaleString("en-US")} ريال — المبلغ المراد سحبه`)
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
           .setPlaceholder("اكتب المبلغ المراد سحبه من البنك"),
@@ -860,12 +879,84 @@ async function handleButton(interaction: any) {
           : txs
               .map(
                 (t) =>
-                  `• ${t.description}\n  🕒 ${new Date(t.timestamp).toLocaleString("ar-SA")}`,
+                  `• ${t.description}\n  🕒 ${new Date(t.timestamp).toLocaleString("en-US")}`,
               )
               .join("\n\n"),
       )
       .setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] , ephemeral: true });
+  }
+
+  if (customId === "pay_violation") {
+    const account = getAccountByUserId(user.id);
+    if (!account)
+      return interaction.reply({ content: "❌ لا يوجد لديك حساب.", ephemeral: true });
+    const violations = getUnpaidViolationsByUserId(user.id);
+    if (violations.length === 0) {
+      return interaction.reply({
+        embeds: [embed(DARK_BLUE).setTitle("✅ لا توجد مخالفات").setDescription("ليس عليك أي مخالفات غير مسددة حالياً.")],
+        ephemeral: true,
+      });
+    }
+    const totalAmount = violations.reduce((s, v) => s + v.amount, 0);
+    const list = violations
+      .map((v, i) => `**${i + 1}.** رقم المخالفة: \`${v.id}\`\n💰 القيمة: **${v.amount.toLocaleString("en-US")} ريال**\n📝 السبب: ${v.reason}\n🕒 ${new Date(v.issuedAt).toLocaleString("en-US")}`)
+      .join("\n\n");
+    const e = embed(RED)
+      .setTitle("🚨 مخالفاتك غير المسددة")
+      .setDescription(list)
+      .addFields({ name: "💳 رصيد بنكك", value: `${account.balance.toLocaleString("en-US")} ريال`, inline: true })
+      .setTimestamp();
+    const btnAll = new ButtonBuilder()
+      .setCustomId("pay_all_violations_btn")
+      .setLabel(`تسديد جميع المخالفات — ${totalAmount.toLocaleString("en-US")} ريال`)
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji("💳");
+    const btnSingle = new ButtonBuilder()
+      .setCustomId("pay_single_violation_btn")
+      .setLabel("تسديد مخالفة واحدة برقمها")
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji("🔢");
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(btnAll, btnSingle);
+    return interaction.reply({ embeds: [e], components: [row] , ephemeral: true });
+  }
+
+  if (customId === "pay_all_violations_btn") {
+    const account = getAccountByUserId(user.id);
+    if (!account)
+      return interaction.reply({ content: "❌ لا يوجد لديك حساب.", ephemeral: true });
+    const result = payAllViolations(user.id, user.id);
+    if (!result.success) {
+      return interaction.reply({
+        embeds: [embed(RED).setTitle("❌ فشل التسديد").setDescription(result.error ?? "خطأ غير معروف")],
+        ephemeral: true,
+      });
+    }
+    return interaction.reply({
+      embeds: [embed(GREEN)
+        .setTitle("✅ تم تسديد جميع المخالفات")
+        .addFields(
+          { name: "عدد المخالفات", value: `${result.paid}`, inline: true },
+          { name: "المبلغ المسدد", value: `${result.total.toLocaleString("en-US")} ريال`, inline: true },
+        )
+        .setTimestamp()],
+      ephemeral: true,
+    });
+  }
+
+  if (customId === "pay_single_violation_btn") {
+    const modal = new ModalBuilder().setCustomId("modal_pay_single_violation").setTitle("🔢 تسديد مخالفة واحدة");
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("violation_id")
+          .setLabel("رقم المخالفة")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder("مثال: V1234567890"),
+      ),
+    );
+    return interaction.showModal(modal);
   }
 
   if (customId === "admin_panel") {
@@ -955,48 +1046,30 @@ async function handleButton(interaction: any) {
     // تحقق: هل صُرفت الرواتب هذا الأسبوع مسبقاً؟
     const dbCheck = getDB();
     if ((dbCheck.settings as any).lastSalaryWeek === getCurrentWeekId()) {
-      return interaction.update({
+      return interaction.reply({
         embeds: [
           embed(RED)
             .setTitle("⛔ تم صرف الرواتب مسبقاً")
             .setDescription("الرواتب صُرفت هذا الأسبوع بالفعل — لا يمكن الصرف مرتين في نفس الأسبوع.")
         ],
         components: [],
+        ephemeral: true,
       });
     }
 
-    // جلب أعضاء السيرفر وحساب رواتبهم حسب الرتبة
-    await interaction.deferUpdate();
-    const guildMembers = await guild.members.fetch().catch(() => null);
-    const salaryList: { userId: string; amount: number; roleName: string }[] =
-      [];
-
-    if (guildMembers) {
-      for (const [, gm] of guildMembers) {
-        if (gm.user.bot) continue;
-        const roleIds = gm.roles.cache.map((r: any) => r.id);
-        const best = getHighestSalaryForMember(roleIds);
-        if (best) {
-          salaryList.push({
-            userId: gm.user.id,
-            amount: best.amount,
-            roleName: best.name,
-          });
-        }
-      }
-    }
-
-    const result = payRoleSalaries(salaryList, user.id);
+    // صرف رواتب الموظفين من حقل الراتب في كل حساب
+    await interaction.deferReply({ ephemeral: true });
+    const result = paySalaries(user.id);
     updateSettings({ lastSalaryWeek: getCurrentWeekId() } as any);
     const db = getDB();
     const e = embed(DARK_BLUE)
       .setTitle("💰 تم صرف الرواتب بنجاح")
-      .setDescription("تم الصرف حسب الرتب المحددة")
+      .setDescription("تم صرف رواتب الموظفين حسب راتب كل حساب")
       .addFields(
         { name: "عدد الموظفين", value: `${result.count}`, inline: true },
         {
           name: "إجمالي المبلغ",
-          value: `${result.paid.toLocaleString()} ريال`,
+          value: `${result.paid.toLocaleString("en-US")} ريال`,
           inline: true,
         },
         { name: "صرف بواسطة", value: `<@${user.id}>`, inline: true },
@@ -1013,9 +1086,10 @@ async function handleButton(interaction: any) {
   }
 
   if (customId === "cancel_action") {
-    return interaction.update({
+    return interaction.reply({
       embeds: [embed(DARK_BLUE).setTitle("❌ تم الإلغاء")],
       components: [],
+      ephemeral: true,
     });
   }
 
@@ -1029,7 +1103,7 @@ async function handleButton(interaction: any) {
     const accounts = getAllAccounts();
     const lines = accounts.map((acc) => {
       const c = acc.cash ?? 0;
-      return `**#${acc.id}** — <@${acc.userId}>\n💵 كاش: ${c.toLocaleString()} | 🏦 بنك: ${acc.balance.toLocaleString()} | 💰 إجمالي: ${(acc.balance + c).toLocaleString()} | ${acc.frozen ? "🔴مجمّد" : "🟢نشط"}`;
+      return `**${formatIBAN(acc.id)}** | 🔑 \`${acc.pin}\` — <@${acc.userId}>\n💵 كاش: ${c.toLocaleString("en-US")} | 🏦 بنك: ${acc.balance.toLocaleString("en-US")} | 💰 إجمالي: ${(acc.balance + c).toLocaleString("en-US")} | ${acc.frozen ? "🔴مجمّد" : "🟢نشط"}`;
     });
     const e = embed(DARK_BLUE)
       .setTitle(`📊 جميع الحسابات (${accounts.length})`)
@@ -1039,7 +1113,7 @@ async function handleButton(interaction: any) {
           : lines.slice(0, 15).join("\n\n"),
       )
       .setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] , ephemeral: true });
   }
 
   if (customId === "admin_add_balance") {
@@ -1056,7 +1130,7 @@ async function handleButton(interaction: any) {
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
           .setCustomId("account_id")
-          .setLabel("رقم الحساب")
+          .setLabel("إيبان الحساب")
           .setStyle(TextInputStyle.Short)
           .setRequired(true),
       ),
@@ -1096,7 +1170,7 @@ async function handleButton(interaction: any) {
           .setLabel("رقم الحساب")
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
-          .setPlaceholder("مثال: 1001"),
+          .setPlaceholder("إيبان الحساب"),
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
@@ -1127,7 +1201,7 @@ async function handleButton(interaction: any) {
         new TextInputBuilder().setCustomId("old_id").setLabel("رقم الحساب الحالي").setStyle(TextInputStyle.Short).setRequired(true),
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("new_id").setLabel("الإيبان الجديد (4 أرقام)").setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(4).setPlaceholder("مثال: 2500"),
+        new TextInputBuilder().setCustomId("new_id").setLabel("الإيبان الجديد (8 أرقام)").setStyle(TextInputStyle.Short).setRequired(true).setMinLength(8).setMaxLength(9).setPlaceholder("مثال: 7491 1342"),
       ),
     );
     return interaction.showModal(modal);
@@ -1182,7 +1256,7 @@ async function handleButton(interaction: any) {
       .addFields(
         { name: "🏧 صرافة (ATM)", value: `**3,000 ريال**\nالشرطة: 2-4 | المواطنين: 1-4`, inline: true },
         { name: "🏪 كاشير", value: `**2,000 ريال**\nالشرطة: 2-6 | المواطنين: 1-5`, inline: true },
-        { name: "🏠 منزل", value: `**5,000 ريال**\nالشرطة: 4-6 | المجرمين: 2-6`, inline: true },
+        { name: "🏠 منزل", value: `**4,000 ريال**\nالشرطة: 4-6 | المجرمين: 2-6`, inline: true },
       )
       .setFooter({ text: "المبالغ تُضاف كـ كاش مباشرة • يُشترط العدد المحدد وإلا لن تُصرف الغنيمة" })
       .setTimestamp();
@@ -1192,7 +1266,7 @@ async function handleButton(interaction: any) {
       new ButtonBuilder().setCustomId("robbery_cashier").setLabel("كاشير").setStyle(ButtonStyle.Primary).setEmoji("🏪"),
       new ButtonBuilder().setCustomId("robbery_house").setLabel("منزل").setStyle(ButtonStyle.Primary).setEmoji("🏠"),
     );
-    return interaction.reply({ embeds: [e], components: [row], ephemeral: true });
+    return interaction.reply({ embeds: [e], components: [row] , ephemeral: true });
   }
 
   if (customId === "robbery_atm" || customId === "robbery_cashier" || customId === "robbery_house") {
@@ -1208,27 +1282,11 @@ async function handleButton(interaction: any) {
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
-          .setCustomId("police_count")
-          .setLabel(`عدد الشرطة الحاضرين (${cfg.policeMin}-${cfg.policeMax})`)
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setPlaceholder("الشرطة الحاضرين"),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder()
-          .setCustomId("civilian_count")
-          .setLabel(`عدد ${cfg.civilLabel} الحاضرين (${cfg.civilMin}-${cfg.civilMax})`)
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setPlaceholder("المواطنين الحاضرين"),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder()
           .setCustomId("robber_account")
-          .setLabel("رقم حساب الشخص الي سرق (واحد فقط)")
+          .setLabel("إيبان الشخص الي سرق")
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
-          .setPlaceholder("إيبان"),
+          .setPlaceholder("مثال: 7491 1342"),
       ),
     );
     return interaction.showModal(modal);
@@ -1245,13 +1303,13 @@ async function handleButton(interaction: any) {
         logs.length === 0
           ? "لا توجد سرقات مسجّلة بعد."
           : logs.map((l) =>
-              `**${l.emoji ?? "🔫"} ${l.typeName}** — ${l.amountPerPerson.toLocaleString()} ريال/شخص\n` +
+              `**${l.emoji ?? "🔫"} ${l.typeName}** — ${l.amountPerPerson.toLocaleString("en-US")} ريال/شخص\n` +
               `👮 شرطة: ${l.policeAccounts.join(", ")} | 👤 مواطنين: ${l.civilianAccounts.join(", ")}\n` +
-              `💰 إجمالي: ${l.totalPaid.toLocaleString()} ريال | 🕒 ${new Date(l.timestamp).toLocaleString("ar-SA")}`
+              `💰 إجمالي: ${l.totalPaid.toLocaleString("en-US")} ريال | 🕒 ${new Date(l.timestamp).toLocaleString("en-US")}`
             ).join("\n\n"),
       )
       .setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] , ephemeral: true });
   }
 
   if (customId === "admin_all_transactions") {
@@ -1270,12 +1328,100 @@ async function handleButton(interaction: any) {
           : txs
               .map(
                 (t) =>
-                  `• ${t.description}\n  🕒 ${new Date(t.timestamp).toLocaleString("ar-SA")}`,
+                  `• ${t.description}\n  🕒 ${new Date(t.timestamp).toLocaleString("en-US")}`,
               )
               .join("\n\n"),
       )
       .setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] , ephemeral: true });
+  }
+
+  if (customId === "admin_violations_log") {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
+    const violations = getAllViolations(25);
+    if (violations.length === 0)
+      return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("📋 سجل المخالفات").setDescription("لا توجد مخالفات مسجّلة بعد.")] , ephemeral: true });
+    const statusLabel = (s: string) => s === "unpaid" ? "⏳ غير مسددة" : s === "paid" ? "✅ مسددة" : "🔴 متهرب";
+    const list = violations.map((v) =>
+      `**\`${v.id}\`** — <@${v.targetUserId}> (إيبان: ${v.targetAccountId})\n` +
+      `💰 **${v.amount.toLocaleString("en-US")} ريال** | ${statusLabel(v.status)}\n` +
+      `📝 ${v.reason}\n` +
+      `🕒 ${new Date(v.issuedAt).toLocaleString("en-US")}`
+    ).join("\n\n");
+    const unpaidCount = violations.filter(v => v.status === "unpaid").length;
+    const paidCount = violations.filter(v => v.status === "paid").length;
+    const evadedCount = violations.filter(v => v.status === "evaded").length;
+    const e = embed(DARK_BLUE)
+      .setTitle("📋 سجل المخالفات (آخر 25)")
+      .setDescription(list.length > 4000 ? list.slice(0, 3990) + "\n..." : list)
+      .addFields(
+        { name: "⏳ غير مسددة", value: `${unpaidCount}`, inline: true },
+        { name: "✅ مسددة", value: `${paidCount}`, inline: true },
+        { name: "🔴 متهربون", value: `${evadedCount}`, inline: true },
+      )
+      .setTimestamp();
+    return interaction.reply({ embeds: [e] , ephemeral: true });
+  }
+
+  if (customId === "admin_cancel_violation") {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
+    const modal = new ModalBuilder().setCustomId("modal_cancel_violation").setTitle("❌ إلغاء مخالفة");
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("violation_id")
+          .setLabel("رقم المخالفة")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder("مثال: V1234567890"),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reason")
+          .setLabel("سبب الإلغاء")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder("مثال: خطأ في التحرير"),
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  if (customId === "admin_issue_violation") {
+    const m = member as GuildMember;
+    if (!isAdmin(m))
+      return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
+    const modal = new ModalBuilder().setCustomId("modal_issue_violation").setTitle("🚨 تحرير مخالفة");
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("target_iban")
+          .setLabel("إيبان المخالِف (رقم الحساب)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder("مثال: 1001"),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("amount")
+          .setLabel("قيمة المخالفة (مبلغ مالي)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder("مثال: 5000"),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reason")
+          .setLabel("سبب المخالفة / الشرح")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(500)
+          .setPlaceholder("اشرح سبب المخالفة بالتفصيل"),
+      ),
+    );
+    return interaction.showModal(modal);
   }
 
   if (customId === "admin_settings") {
@@ -1392,7 +1538,7 @@ async function handleButton(interaction: any) {
             { name: "المستخدم", value: `<@${pending.userId}>`, inline: true },
             { name: "الاسم", value: (pending as any).name || pending.displayName, inline: true },
             { name: "روبلوكس", value: robloxUser || "—", inline: true },
-            { name: "رقم الحساب", value: `**${account.id}**`, inline: true },
+            { name: "رقم الحساب", value: `**${formatIBAN(account.id)}**`, inline: true },
             { name: "قبل بواسطة", value: `<@${user.id}>`, inline: true },
           ).setTimestamp();
         if (avatar) logE.setThumbnail(avatar);
@@ -1403,12 +1549,12 @@ async function handleButton(interaction: any) {
       .setTitle("✅ تمت الموافقة على الحساب")
       .addFields(
         { name: "المستخدم", value: `<@${pending.userId}>`, inline: true },
-        { name: "رقم الحساب", value: `**${account.id}**`, inline: true },
-        { name: "الراتب", value: `${account.salary.toLocaleString()} ريال`, inline: true },
+        { name: "رقم الحساب", value: `**${formatIBAN(account.id)}**`, inline: true },
+        { name: "الراتب", value: `${account.salary.toLocaleString("en-US")} ريال`, inline: true },
         { name: "تمت الموافقة بواسطة", value: `<@${user.id}>`, inline: true },
       )
       .setTimestamp();
-    await interaction.update({ embeds: [e], components: [] });
+    await interaction.reply({ embeds: [e], components: [], ephemeral: true });
     const requestUser = await client.users
       .fetch(pending.userId)
       .catch(() => null);
@@ -1419,7 +1565,7 @@ async function handleButton(interaction: any) {
             embed(DARK_BLUE)
               .setTitle("✅ تمت الموافقة على حسابك")
               .setDescription(
-                `رقم حسابك: **${account.id}**\nيمكنك الآن استخدام جميع خدمات البنك.`,
+                `رقم حسابك: **${formatIBAN(account.id)}**\nيمكنك الآن استخدام جميع خدمات البنك.`,
               )
               .setTimestamp(),
           ],
@@ -1450,7 +1596,7 @@ async function handleButton(interaction: any) {
         { name: "تم الرفض بواسطة", value: `<@${user.id}>`, inline: true },
       )
       .setTimestamp();
-    await interaction.update({ embeds: [e], components: [] });
+    await interaction.reply({ embeds: [e], components: [], ephemeral: true });
     const requestUser = await client.users
       .fetch(pending.userId)
       .catch(() => null);
@@ -1471,6 +1617,8 @@ async function handleButton(interaction: any) {
 
   // ─── Weapons: resource view ───────────────
   if (customId.startsWith("wresource_")) {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const key = customId.replace("wresource_", "");
     const item = WEAPON_ITEMS[key];
     if (!item) return interaction.reply({ content: "❌ مورد غير معروف.", ephemeral: true });
@@ -1479,8 +1627,8 @@ async function handleButton(interaction: any) {
     const e = embed(DARK_BLUE)
       .setTitle(`${item.emoji} ${item.name}${item.blackMarket ? "  —  🖤 سوق سوداء" : ""}`)
       .addFields(
-        { name: "💰 السعر", value: `**${item.price.toLocaleString()}$** للحبة`, inline: true },
-        { name: "📦 المخزون المتاح", value: `**${stock.toLocaleString()}** حبة`, inline: true },
+        { name: "💰 السعر", value: `**${item.price.toLocaleString("en-US")}$** للحبة`, inline: true },
+        { name: "📦 المخزون المتاح", value: `**${stock.toLocaleString("en-US")}** حبة`, inline: true },
         { name: "📝 الوصف", value: item.desc, inline: false },
       )
       .setTimestamp();
@@ -1488,25 +1636,29 @@ async function handleButton(interaction: any) {
       new ButtonBuilder().setCustomId(`weapon_buy_${key}`).setLabel("شراء 🛒").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`weapon_transfer_${key}`).setLabel("تحويل موارد 📦").setStyle(ButtonStyle.Primary),
     );
-    return interaction.update({ embeds: [e], components: [row] });
+    return interaction.reply({ embeds: [e], components: [row], ephemeral: true });
   }
 
   if (customId === "wvault") {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const account = getAccountByUserId(user.id);
     if (!account) return interaction.reply({ content: "❌ لا يوجد لديك حساب.", ephemeral: true });
     const inv = account.inventory ?? {};
     const lines = Object.entries(WEAPON_ITEMS).map(([k, v]) => {
       const qty = inv[k] ?? 0;
-      return `${v.emoji} **${v.name}**: ${qty.toLocaleString()} حبة`;
+      return `${v.emoji} **${v.name}**: ${qty.toLocaleString("en-US")} حبة`;
     }).join("\n");
     const e = embed(DARK_BLUE)
       .setTitle("🗄️ خزنتك الخاصة")
       .setDescription(lines || "لا توجد موارد في خزنتك.")
       .setTimestamp();
-    return interaction.update({ embeds: [e], components: [] });
+    return interaction.reply({ embeds: [e], components: [], ephemeral: true });
   }
 
   if (customId === "wtransfer_weapon") {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const account = getAccountByUserId(user.id);
     if (!account) return interaction.reply({ content: "❌ لا يوجد لديك حساب.", ephemeral: true });
     const db = getDB();
@@ -1526,7 +1678,7 @@ async function handleButton(interaction: any) {
         new TextInputBuilder().setCustomId("qty").setLabel("الكمية").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("مثال: 1"),
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("to_iban").setLabel("إيبان المستلم").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("مكون من أربعة أرقام"),
+        new TextInputBuilder().setCustomId("to_iban").setLabel("إيبان المستلم").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("مثال: 7491 1342"),
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder().setCustomId("pin").setLabel("رمز PIN الخاص بك").setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(4).setPlaceholder("****"),
@@ -1536,6 +1688,8 @@ async function handleButton(interaction: any) {
   }
 
   if (customId === "wmy_weapons") {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const account = getAccountByUserId(user.id);
     if (!account) return interaction.reply({ content: "❌ لا يوجد لديك حساب.", ephemeral: true });
     const db = getDB();
@@ -1548,10 +1702,12 @@ async function handleButton(interaction: any) {
       .setTitle("🔫 أسلحتي")
       .setDescription(weaponLines || "لا توجد أسلحة مملوكة.")
       .setTimestamp();
-    return interaction.update({ embeds: [e], components: [] });
+    return interaction.reply({ embeds: [e], components: [], ephemeral: true });
   }
 
   if (customId === "wweapons_list") {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const wMenu = new StringSelectMenuBuilder()
       .setCustomId("weapons_catalog")
       .setPlaceholder("🔫 اختر سلاحًا للعرض...")
@@ -1560,17 +1716,19 @@ async function handleButton(interaction: any) {
           new StringSelectMenuOptionBuilder()
             .setLabel(w.name)
             .setValue(`wweapon_${k}`)
-            .setDescription(`${w.type} | قوة: ${w.damage} | ذخيرة: ${w.ammo} | ${w.cost.toLocaleString()}$`)
+            .setDescription(`${w.type} | قوة: ${w.damage} | ذخيرة: ${w.ammo} | ${w.cost.toLocaleString("en-US")}$`)
         )
       );
     const e = embed(DARK_BLUE)
       .setTitle("🔫 قائمة الأسلحة القابلة للتصنيع")
       .setDescription("اختر سلاحًا من القائمة لعرض موارده ومواصفاته.")
       .setTimestamp();
-    return interaction.update({ embeds: [e], components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(wMenu)] });
+    return interaction.reply({ embeds: [e], components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(wMenu)], ephemeral: true });
   }
 
   if (customId.startsWith("wweapon_")) {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const wKey = customId.replace("wweapon_", "");
     const w = CRAFTABLE_WEAPONS[wKey];
     if (!w) return interaction.reply({ content: "❌ سلاح غير موجود.", ephemeral: true });
@@ -1578,6 +1736,21 @@ async function handleButton(interaction: any) {
       const ri = WEAPON_ITEMS[rk];
       return ri ? `${ri.emoji} **${ri.name}**: ${qty}` : `${rk}: ${qty}`;
     }).join("\n");
+    const account = getAccountByUserId(user.id);
+    const inv = account?.inventory ?? {};
+    const missingRes = Object.entries(w.recipe).filter(([rk, need]) => (inv[rk] ?? 0) < need);
+    const cashOk = (account?.cash ?? 0) >= w.cost;
+    const canCraft = account && !account.frozen && missingRes.length === 0 && cashOk;
+
+    const statusLines = Object.entries(w.recipe).map(([rk, need]) => {
+      const ri = WEAPON_ITEMS[rk];
+      const have = inv[rk] ?? 0;
+      const ok = have >= need;
+      return `${ok ? "✅" : "❌"} ${ri ? ri.emoji + " " + ri.name : rk}: ${have.toLocaleString("en-US")}/${need} ${ok ? "" : `(ناقص ${(need - have).toLocaleString("en-US")})` }`;
+    }).join("\n");
+
+    const cashLine = `${cashOk ? "✅" : "❌"} 💵 كاش: ${(account?.cash ?? 0).toLocaleString("en-US")}$ / ${w.cost.toLocaleString("en-US")}$${cashOk ? "" : ` (ناقص ${(w.cost - (account?.cash ?? 0)).toLocaleString("en-US")}$)`}`;
+
     const e = embed(DARK_BLUE)
       .setTitle(`🔫 ${w.name}`)
       .addFields(
@@ -1585,14 +1758,82 @@ async function handleButton(interaction: any) {
         { name: "🔴 ذخيرة / مخزن", value: `${w.ammo}`, inline: true },
         { name: "🔁 النوع", value: w.type, inline: true },
         { name: "⚖️ الوزن", value: w.weight, inline: true },
-        { name: "💵 التكلفة الإجمالية", value: `${w.cost.toLocaleString()}$`, inline: true },
+        { name: "💵 التكلفة الإجمالية", value: `${w.cost.toLocaleString("en-US")}$`, inline: true },
         { name: "🔧 الموارد المطلوبة", value: recipeLines, inline: false },
+        { name: canCraft ? "✅ يمكنك التصنيع" : "❌ حالة التصنيع", value: statusLines + "\n" + cashLine, inline: false },
       )
       .setTimestamp();
-    return interaction.update({ embeds: [e], components: [] });
+
+    const craftRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`craft_weapon_${wKey}`)
+        .setLabel("🔨 تصنيع السلاح")
+        .setStyle(canCraft ? ButtonStyle.Success : ButtonStyle.Danger)
+        .setDisabled(!canCraft),
+    );
+    return interaction.reply({ embeds: [e], components: [craftRow], ephemeral: true });
+  }
+
+  if (customId.startsWith("craft_weapon_")) {
+    const wKey = customId.replace("craft_weapon_", "");
+    const w = CRAFTABLE_WEAPONS[wKey];
+    if (!w) return interaction.reply({ content: "❌ سلاح غير موجود.", ephemeral: true });
+
+    const account = getAccountByUserId(user.id);
+    if (!account) return interaction.reply({ content: "❌ لا يوجد لديك حساب.", ephemeral: true });
+    if (account.frozen) return interaction.reply({ content: "❌ حسابك مجمّد.", ephemeral: true });
+
+    const db = getDB();
+    const accDb = db.accounts[account.id];
+    if (!accDb) return interaction.reply({ content: "❌ خطأ في البيانات.", ephemeral: true });
+    if (!accDb.inventory) accDb.inventory = {};
+
+    const inv = accDb.inventory as Record<string, number>;
+    const missingRes: string[] = [];
+    for (const [rk, need] of Object.entries(w.recipe)) {
+      const have = inv[rk] ?? 0;
+      if (have < need) {
+        const ri = WEAPON_ITEMS[rk];
+        missingRes.push(`${ri ? ri.emoji + " " + ri.name : rk}: تملك ${have.toLocaleString("en-US")} / تحتاج ${(need as number).toLocaleString("en-US")}`);
+      }
+    }
+
+    const cash = accDb.cash ?? 0;
+    if (cash < w.cost) {
+      missingRes.push(`💵 الكاش: تملك ${cash.toLocaleString("en-US")}$ / تحتاج ${w.cost.toLocaleString("en-US")}$ (ناقص ${(w.cost - cash).toLocaleString("en-US")}$)`);
+    }
+
+    if (missingRes.length > 0) {
+      const e = embed(0xff4444)
+        .setTitle(`❌ تعذّر تصنيع ${w.name}`)
+        .addFields({ name: "السبب", value: missingRes.join("\n"), inline: false })
+        .setTimestamp();
+      return interaction.reply({ embeds: [e], ephemeral: true });
+    }
+
+    for (const [rk, need] of Object.entries(w.recipe)) {
+      inv[rk] = (inv[rk] ?? 0) - (need as number);
+    }
+    accDb.cash = cash - w.cost;
+    if (!accDb.craftedWeapons) accDb.craftedWeapons = {};
+    accDb.craftedWeapons[wKey] = ((accDb.craftedWeapons[wKey] as number) ?? 0) + 1;
+
+    saveDB(db);
+
+    const e = embed(0x00cc66)
+      .setTitle(`✅ تم   ${w.name} بنجاح!`)
+      .addFields(
+        { name: "🔫 السلاح", value: w.name, inline: true },
+        { name: "💵 الكاش المتبقي", value: `${accDb.cash.toLocaleString("en-US")}$`, inline: true },
+        { name: "🔧 الأسلحة المصنّعة", value: `${accDb.craftedWeapons[wKey]}`, inline: true },
+      )
+      .setTimestamp();
+    return interaction.reply({ embeds: [e], ephemeral: true });
   }
 
   if (customId === "wactivate") {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const modal = new ModalBuilder().setCustomId("modal_weapon_activate").setTitle("🔑 طلب تفعيل سلاح");
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -1609,6 +1850,8 @@ async function handleButton(interaction: any) {
   }
 
   if (customId.startsWith("weapon_buy_")) {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const key = customId.replace("weapon_buy_", "");
     const item = WEAPON_ITEMS[key];
     if (!item) return interaction.reply({ content: "❌ مورد غير معروف.", ephemeral: true });
@@ -1629,6 +1872,8 @@ async function handleButton(interaction: any) {
   }
 
   if (customId.startsWith("weapon_transfer_")) {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ هذا الخيار للإدارة فقط.", ephemeral: true });
     const key = customId.replace("weapon_transfer_", "");
     const item = WEAPON_ITEMS[key];
     if (!item) return interaction.reply({ content: "❌ مورد غير معروف.", ephemeral: true });
@@ -1638,7 +1883,7 @@ async function handleButton(interaction: any) {
     const modal = new ModalBuilder().setCustomId(`modal_weapon_transfer_${key}`).setTitle(`📦 تحويل ${item.emoji} ${item.name}`);
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("to_iban").setLabel("رقم إيبان المستلم").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("مكون من اربعة ارقام"),
+        new TextInputBuilder().setCustomId("to_iban").setLabel("رقم إيبان المستلم").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("مثال: 7491 1342"),
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder().setCustomId("qty").setLabel(`الكمية | تملك: ${myQty}`).setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("مثال: 5"),
@@ -1659,10 +1904,10 @@ async function handleButton(interaction: any) {
     if (!isAdmin(m)) return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
     const db = getDB();
     const lines = Object.entries(WEAPON_ITEMS).map(([k, v]) =>
-      `${v.emoji} **${v.name}**: ${((db.weaponStock ?? {})[k] ?? 0).toLocaleString()} حبة`
+      `${v.emoji} **${v.name}**: ${((db.weaponStock ?? {})[k] ?? 0).toLocaleString("en-US")} حبة`
     ).join("\n");
     const e = embed(DARK_BLUE).setTitle("📦 الستوك الحالي").setDescription(lines).setTimestamp();
-    return interaction.reply({ embeds: [e], ephemeral: true });
+    return interaction.reply({ embeds: [e] , ephemeral: true });
   }
 
   if (customId === "wadmin_stock_set") {
@@ -1723,7 +1968,7 @@ async function handleButton(interaction: any) {
     const modal = new ModalBuilder().setCustomId("modal_wadmin_view_inv").setTitle("👁️ عرض مخزون شخص");
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("iban").setLabel("رقم الإيبان").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("يتكون من اربعة ارقام"),
+        new TextInputBuilder().setCustomId("iban").setLabel("رقم الإيبان").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("مثال: 7491 1342"),
       ),
     );
     return interaction.showModal(modal);
@@ -1834,7 +2079,7 @@ async function handleButton(interaction: any) {
         { name: "مقدم الطلب", value: `<@${act.userId}>`, inline: true },
         { name: "تم الرفض بواسطة", value: `<@${user.id}>`, inline: true },
       ).setTimestamp();
-    await interaction.update({ embeds: [e], components: [] });
+    await interaction.reply({ embeds: [e], components: [], ephemeral: true });
     const reqUser = await client.users.fetch(act.userId).catch(() => null);
     if (reqUser) await reqUser.send({ embeds: [embed(DARK_BLUE).setTitle("❌ رُفض طلب تفعيل سلاحك").addFields({ name: "السلاح", value: act.weaponName, inline: true }).setTimestamp()] }).catch(() => {});
     return;
@@ -1871,7 +2116,7 @@ async function handleModal(interaction: any) {
               { name: "المستخدم", value: `<@${user.id}>`, inline: true },
               { name: "الاسم", value: name, inline: true },
               { name: "روبلوكس", value: robloxUsername, inline: true },
-              { name: "رقم الحساب", value: `**${account.id}**`, inline: true },
+              { name: "رقم الحساب", value: `**${formatIBAN(account.id)}**`, inline: true },
             ).setTimestamp();
           if (avatar) logE.setThumbnail(avatar);
           await logCh.send({ embeds: [logE] }).catch(() => {});
@@ -1883,7 +2128,7 @@ async function handleModal(interaction: any) {
           .addFields(
             { name: "الاسم", value: name, inline: true },
             { name: "روبلوكس", value: robloxUsername, inline: true },
-            { name: "رقم الحساب (إيبان)", value: `**${account.id}**`, inline: true },
+            { name: "رقم الحساب (إيبان)", value: `**${formatIBAN(account.id)}**`, inline: true },
             { name: "رمز PIN", value: "🔒 تم الحفظ بأمان", inline: true },
           )
           .setTimestamp(),
@@ -1915,7 +2160,7 @@ async function handleModal(interaction: any) {
           { name: "الاسم", value: name, inline: true },
           { name: "روبلوكس", value: robloxUsername, inline: true },
           { name: "العمر", value: `${age}`, inline: true },
-          { name: "وقت الطلب", value: new Date().toLocaleString("ar-SA"), inline: true },
+          { name: "وقت الطلب", value: new Date().toLocaleString("en-US"), inline: true },
         )
         .setTimestamp()
         .setFooter({ text: `معرف الطلب: ${reqId}` });
@@ -1976,8 +2221,8 @@ async function handleModal(interaction: any) {
           .setTitle("💸 وصلك تحويل!")
           .addFields(
             { name: "من", value: `<@${user.id}>`, inline: true },
-            { name: "المبلغ", value: `**${amount.toLocaleString()} ريال**`, inline: true },
-            { name: "رصيدك الجديد", value: `${toAcct.balance.toLocaleString()} ريال`, inline: true },
+            { name: "المبلغ", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
+            { name: "رصيدك الجديد", value: `${toAcct.balance.toLocaleString("en-US")} ريال`, inline: true },
           )
           .setTimestamp();
         if (reason) dmEmbed.addFields({ name: "📝 السبب", value: reason, inline: false });
@@ -1989,12 +2234,12 @@ async function handleModal(interaction: any) {
       .addFields(
         { name: "من حساب", value: `**${fromAccount.id}**`, inline: true },
         { name: "إلى حساب", value: `**${toAccountId}**`, inline: true },
-        { name: "المبلغ", value: `**${amount.toLocaleString()} ريال**`, inline: true },
-        { name: "رصيدك الجديد", value: `${updatedFrom?.balance.toLocaleString()} ريال`, inline: true },
+        { name: "المبلغ", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
+        { name: "رصيدك الجديد", value: `${updatedFrom?.balance.toLocaleString("en-US")} ريال`, inline: true },
       )
       .setTimestamp();
     if (reason) replyEmbed.addFields({ name: "📝 السبب", value: reason, inline: false });
-    return interaction.reply({ embeds: [replyEmbed], ephemeral: true });
+    return interaction.reply({ embeds: [replyEmbed] , ephemeral: true });
   }
 
   if (customId === "modal_freeze") {
@@ -2019,7 +2264,7 @@ async function handleModal(interaction: any) {
         embed(doFreeze ? RED : GREEN)
           .setTitle(doFreeze ? "❄️ تم تجميد الحساب" : "✅ تم الغاء التجميد")
           .addFields(
-            { name: "رقم الحساب", value: `**${accountId}**`, inline: true },
+            { name: "رقم الحساب", value: `**${formatIBAN(accountId)}**`, inline: true },
             { name: "المستخدم", value: `<@${account.userId}>`, inline: true },
           )
           .setTimestamp(),
@@ -2051,12 +2296,12 @@ async function handleModal(interaction: any) {
       embeds: [embed(DARK_BLUE)
         .setTitle("➕ تم إضافة المال")
         .addFields(
-          { name: "رقم الحساب", value: `**${accountId}**`, inline: true },
-          { name: "المبلغ المضاف", value: `**${amount.toLocaleString()} ريال**`, inline: true },
+          { name: "رقم الحساب", value: `**${formatIBAN(accountId)}**`, inline: true },
+          { name: "المبلغ المضاف", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
           { name: "المحفظة", value: target === "cash" ? "💵 كاش" : "🏦 بنك", inline: true },
-          { name: "💵 كاش الآن", value: `${addedCash.toLocaleString()} ريال`, inline: true },
-          { name: "🏦 بنك الآن", value: `${addedBank.toLocaleString()} ريال`, inline: true },
-          { name: "💰 الإجمالي", value: `${(addedCash + addedBank).toLocaleString()} ريال`, inline: true },
+          { name: "💵 كاش الآن", value: `${addedCash.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "🏦 بنك الآن", value: `${addedBank.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "💰 الإجمالي", value: `${(addedCash + addedBank).toLocaleString("en-US")} ريال`, inline: true },
         )
         .setTimestamp(),
       ],
@@ -2088,12 +2333,12 @@ async function handleModal(interaction: any) {
       embeds: [embed(DARK_BLUE)
         .setTitle("➖ تم خصم المال")
         .addFields(
-          { name: "رقم الحساب", value: `**${accountId}**`, inline: true },
-          { name: "المبلغ المخصوم", value: `**${amount.toLocaleString()} ريال**`, inline: true },
+          { name: "رقم الحساب", value: `**${formatIBAN(accountId)}**`, inline: true },
+          { name: "المبلغ المخصوم", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
           { name: "المحفظة", value: target === "cash" ? "💵 كاش" : "🏦 بنك", inline: true },
-          { name: "💵 كاش الآن", value: `${remCash.toLocaleString()} ريال`, inline: true },
-          { name: "🏦 بنك الآن", value: `${remBank.toLocaleString()} ريال`, inline: true },
-          { name: "💰 الإجمالي", value: `${(remCash + remBank).toLocaleString()} ريال`, inline: true },
+          { name: "💵 كاش الآن", value: `${remCash.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "🏦 بنك الآن", value: `${remBank.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "💰 الإجمالي", value: `${(remCash + remBank).toLocaleString("en-US")} ريال`, inline: true },
         )
         .setTimestamp(),
       ],
@@ -2121,10 +2366,10 @@ async function handleModal(interaction: any) {
       embeds: [embed(DARK_BLUE)
         .setTitle("🏦 تم الإيداع بنجاح")
         .addFields(
-          { name: "المبلغ المودع", value: `**${amount.toLocaleString()} ريال**`, inline: true },
-          { name: "💵 كاش المتبقي", value: `${depCash.toLocaleString()} ريال`, inline: true },
-          { name: "🏦 رصيد البنك الجديد", value: `${updated.balance.toLocaleString()} ريال`, inline: true },
-          { name: "💰 الإجمالي", value: `${(depCash + updated.balance).toLocaleString()} ريال`, inline: true },
+          { name: "المبلغ المودع", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
+          { name: "💵 كاش المتبقي", value: `${depCash.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "🏦 رصيد البنك الجديد", value: `${updated.balance.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "💰 الإجمالي", value: `${(depCash + updated.balance).toLocaleString("en-US")} ريال`, inline: true },
         )
         .setTimestamp(),
       ],
@@ -2140,17 +2385,17 @@ async function handleModal(interaction: any) {
       return interaction.reply({ content: "❌ المبلغ غير صحيح.", ephemeral: true });
     const result = withdraw(account.id, amount, user.id);
     if (!result.success)
-      return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل السحب").setDescription(result.error!)], ephemeral: true });
+      return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل السحب").setDescription(result.error!)] , ephemeral: true });
     const updated = getAccountById(account.id)!;
     const wCash = updated.cash ?? 0;
     return interaction.reply({
       embeds: [embed(DARK_BLUE)
         .setTitle("💵 تم السحب بنجاح")
         .addFields(
-          { name: "المبلغ المسحوب", value: `**${amount.toLocaleString()} ريال**`, inline: true },
-          { name: "🏦 رصيد البنك الجديد", value: `${updated.balance.toLocaleString()} ريال`, inline: true },
-          { name: "💵 الكاش الجديد", value: `${wCash.toLocaleString()} ريال`, inline: true },
-          { name: "💰 الإجمالي", value: `${(wCash + updated.balance).toLocaleString()} ريال`, inline: true },
+          { name: "المبلغ المسحوب", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
+          { name: "🏦 رصيد البنك الجديد", value: `${updated.balance.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "💵 الكاش الجديد", value: `${wCash.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "💰 الإجمالي", value: `${(wCash + updated.balance).toLocaleString("en-US")} ريال`, inline: true },
         ).setTimestamp(),
       ],
       ephemeral: true,
@@ -2164,7 +2409,7 @@ async function handleModal(interaction: any) {
     const newId = interaction.fields.getTextInputValue("new_id").trim();
     const result = changeAccountId(oldId, newId, user.id);
     if (!result.success)
-      return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل تغيير الإيبان").setDescription(result.error!)], ephemeral: true });
+      return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل تغيير الإيبان").setDescription(result.error!)] , ephemeral: true });
     const account = getAccountById(newId);
     return interaction.reply({
       embeds: [embed(DARK_BLUE)
@@ -2190,7 +2435,7 @@ async function handleModal(interaction: any) {
     if (isNaN(value) || value <= 0)
       return interaction.reply({ content: "❌ القيمة غير صحيحة.", ephemeral: true });
     const { count, total } = bulkAddBalance(value, mode, target, user.id);
-    const label = mode === "percent" ? `${value}%` : `${value.toLocaleString()} ريال`;
+    const label = mode === "percent" ? `${value}%` : `${value.toLocaleString("en-US")} ريال`;
     return interaction.reply({
       embeds: [embed(DARK_BLUE)
         .setTitle("➕ تمت الإضافة الجماعية")
@@ -2198,7 +2443,7 @@ async function handleModal(interaction: any) {
           { name: "القيمة", value: label, inline: true },
           { name: "المحفظة", value: target === "cash" ? "💵 كاش" : "🏦 بنك", inline: true },
           { name: "عدد الحسابات", value: `${count}`, inline: true },
-          { name: "الإجمالي المضاف", value: `${total.toLocaleString()} ريال`, inline: true },
+          { name: "الإجمالي المضاف", value: `${total.toLocaleString("en-US")} ريال`, inline: true },
         ).setTimestamp(),
       ],
       ephemeral: true,
@@ -2216,7 +2461,7 @@ async function handleModal(interaction: any) {
     if (isNaN(value) || value <= 0)
       return interaction.reply({ content: "❌ القيمة غير صحيحة.", ephemeral: true });
     const { count, total } = bulkRemoveBalance(value, mode, target, user.id);
-    const label = mode === "percent" ? `${value}%` : `${value.toLocaleString()} ريال`;
+    const label = mode === "percent" ? `${value}%` : `${value.toLocaleString("en-US")} ريال`;
     return interaction.reply({
       embeds: [embed(DARK_BLUE)
         .setTitle("➖ تم الخصم الجماعي")
@@ -2224,7 +2469,7 @@ async function handleModal(interaction: any) {
           { name: "القيمة", value: label, inline: true },
           { name: "المحفظة", value: target === "cash" ? "💵 كاش" : "🏦 بنك", inline: true },
           { name: "عدد الحسابات", value: `${count}`, inline: true },
-          { name: "الإجمالي المخصوم", value: `${total.toLocaleString()} ريال`, inline: true },
+          { name: "الإجمالي المخصوم", value: `${total.toLocaleString("en-US")} ريال`, inline: true },
         ).setTimestamp(),
       ],
       ephemeral: true,
@@ -2240,35 +2485,15 @@ async function handleModal(interaction: any) {
     const rType = customId.replace("modal_robbery_", "") as RobberyType;
     const cfg = ROBBERY_CONFIG[rType];
 
-    const policeCount = parseInt(interaction.fields.getTextInputValue("police_count").trim());
-    const civilCount  = parseInt(interaction.fields.getTextInputValue("civilian_count").trim());
     const robberAccId = interaction.fields.getTextInputValue("robber_account").trim();
-
-    if (isNaN(policeCount) || policeCount < cfg.policeMin || policeCount > cfg.policeMax) {
-      return interaction.reply({
-        embeds: [embed(DARK_BLUE)
-          .setTitle("❌ عدد الشرطة غير صحيح")
-          .setDescription(`عدد الشرطة لازم يكون بين **${cfg.policeMin}** و **${cfg.policeMax}**.\nأدخلت: **${isNaN(policeCount) ? "—" : policeCount}**`)],
-        ephemeral: true,
-      });
-    }
-
-    if (isNaN(civilCount) || civilCount < cfg.civilMin || civilCount > cfg.civilMax) {
-      return interaction.reply({
-        embeds: [embed(DARK_BLUE)
-          .setTitle(`❌ عدد ${cfg.civilLabel} غير صحيح`)
-          .setDescription(`عدد ${cfg.civilLabel} لازم يكون بين **${cfg.civilMin}** و **${cfg.civilMax}**.\nأدخلت: **${isNaN(civilCount) ? "—" : civilCount}**`)],
-        ephemeral: true,
-      });
-    }
 
     const { results } = logRobbery(
       {
         type: rType,
         typeName: cfg.name,
         amountPerPerson: cfg.amount,
-        policeAccounts: [`${policeCount} أشخاص`],
-        civilianAccounts: [`${civilCount} أشخاص`],
+        policeAccounts: [],
+        civilianAccounts: [],
         totalPaid: 0,
         timestamp: new Date().toISOString(),
         performedBy: user.id,
@@ -2286,11 +2511,9 @@ async function handleModal(interaction: any) {
       .setTitle(`${cfg.emoji} سرقة ${cfg.name} — ${success ? "✅ تم الصرف" : "❌ فشل"}`)
       .addFields(
         { name: "🔫 نوع السرقة", value: `**${cfg.name}**`, inline: true },
-        { name: "💰 الغنيمة", value: `**${cfg.amount.toLocaleString()} ريال كاش**`, inline: true },
-        { name: "🕵️ السارق", value: success ? `✅ حساب #${robberAccId}` : `❌ حساب #${robberAccId}\n${errMsg ?? ""}`, inline: true },
-        { name: "👮 شرطة حاضرين", value: `${policeCount} أشخاص`, inline: true },
-        { name: `👥 ${cfg.civilLabel} حاضرين`, value: `${civilCount} أشخاص`, inline: true },
-        { name: "💵 كاش الحساب الآن", value: success ? `${newCash.toLocaleString()} ريال` : "—", inline: true },
+        { name: "💰 الغنيمة", value: `**${cfg.amount.toLocaleString("en-US")} ريال كاش**`, inline: true },
+        { name: "🕵️ السارق", value: success ? `✅ إيبان ${formatIBAN(robberAccId)}` : `❌ إيبان ${formatIBAN(robberAccId)}\n${errMsg ?? ""}`, inline: true },
+        { name: "💵 كاش الحساب الآن", value: success ? `${newCash.toLocaleString("en-US")} ريال` : "—", inline: true },
       )
       .setTimestamp()
       .setFooter({ text: `سجّل بواسطة: ${user.username}` });
@@ -2314,8 +2537,8 @@ async function handleModal(interaction: any) {
             .setTitle(`${cfg.emoji}  🚨 وصلك مبلغ سرقة`)
             .addFields(
               { name: "🔫 نوع السرقة", value: `**${cfg.name}**`, inline: true },
-              { name: "💰 الغنيمة", value: `**${cfg.amount.toLocaleString()} ريال كاش**`, inline: true },
-              { name: "💵 كاشك الآن", value: `${newCash.toLocaleString()} ريال`, inline: true },
+              { name: "💰 الغنيمة", value: `**${cfg.amount.toLocaleString("en-US")} ريال كاش**`, inline: true },
+              { name: "💵 كاشك الآن", value: `${newCash.toLocaleString("en-US")} ريال`, inline: true },
             )
             .setTimestamp()],
         }).catch(() => {});
@@ -2372,15 +2595,15 @@ async function handleModal(interaction: any) {
     if (isNaN(qtyRaw) || qtyRaw < 1) return interaction.reply({ content: "❌ الكمية غير صحيحة.", ephemeral: true });
     if (pinIn !== account.pin) return interaction.reply({ content: "❌ رمز PIN غير صحيح.", ephemeral: true });
     const result = buyResource(account.id, key, qtyRaw, item.price);
-    if (!result.success) return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل الشراء").setDescription(result.error!)], ephemeral: true });
+    if (!result.success) return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل الشراء").setDescription(result.error!)] , ephemeral: true });
     const total = qtyRaw * item.price;
     return interaction.reply({
       embeds: [embed(DARK_BLUE)
         .setTitle(`✅ تم الشراء — ${item.emoji} ${item.name}`)
         .addFields(
-          { name: "الكمية", value: `${qtyRaw.toLocaleString()} حبة`, inline: true },
-          { name: "المبلغ المدفوع", value: `${total.toLocaleString()} ريال`, inline: true },
-          { name: "رصيدك الجديد", value: `${(account.balance - total).toLocaleString()} ريال`, inline: true },
+          { name: "الكمية", value: `${qtyRaw.toLocaleString("en-US")} حبة`, inline: true },
+          { name: "المبلغ المدفوع", value: `${total.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "رصيدك الجديد", value: `${(account.balance - total).toLocaleString("en-US")} ريال`, inline: true },
         ).setTimestamp()],
       ephemeral: true,
     });
@@ -2401,7 +2624,7 @@ async function handleModal(interaction: any) {
     const toAcc = getAccountById(toIban);
     if (!toAcc) return interaction.reply({ content: `❌ لم يُعثر على حساب برقم **${toIban}**.`, ephemeral: true });
     const result = transferResources(account.id, toIban, key, qtyRaw);
-    if (!result.success) return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل التحويل").setDescription(result.error!)], ephemeral: true });
+    if (!result.success) return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل التحويل").setDescription(result.error!)] , ephemeral: true });
     const recipientUser = await client.users.fetch(toAcc.userId).catch(() => null);
     if (recipientUser) {
       const dmEmbed = embed(DARK_BLUE)
@@ -2420,7 +2643,7 @@ async function handleModal(interaction: any) {
         { name: "إلى", value: `<@${toAcc.userId}> (#${toIban})`, inline: true },
       ).setTimestamp();
     if (reason) replyEmbed.addFields({ name: "📝 السبب", value: reason, inline: false });
-    return interaction.reply({ embeds: [replyEmbed], ephemeral: true });
+    return interaction.reply({ embeds: [replyEmbed] , ephemeral: true });
   }
 
   if (customId === "modal_weapon_activate") {
@@ -2441,7 +2664,7 @@ async function handleModal(interaction: any) {
         { name: "اسم السلاح", value: weaponName, inline: true },
         { name: "صاحب السلاح", value: ownerName, inline: true },
         { name: "المستخدم", value: userOfWeapon, inline: true },
-        { name: "الوقت", value: new Date().toLocaleString("ar-SA"), inline: true },
+        { name: "الوقت", value: new Date().toLocaleString("en-US"), inline: true },
       ).setTimestamp().setFooter({ text: `معرف الطلب: ${reqId}` });
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`approve_weapon_act_${reqId}`).setLabel("قبول").setStyle(ButtonStyle.Success).setEmoji("✅"),
@@ -2464,7 +2687,7 @@ async function handleModal(interaction: any) {
         { name: "مقدم الطلب", value: `<@${act.userId}>`, inline: true },
         { name: "تم القبول بواسطة", value: `<@${user.id}>`, inline: true },
       ).setTimestamp();
-    await interaction.update({ embeds: [e], components: [] });
+    await interaction.reply({ embeds: [e], components: [], ephemeral: true });
     const reqUser = await client.users.fetch(act.userId).catch(() => null);
     if (reqUser) await reqUser.send({
       embeds: [embed(DARK_BLUE)
@@ -2489,7 +2712,7 @@ async function handleModal(interaction: any) {
     if (!key) return interaction.reply({ content: `❌ مورد غير معروف: **${resInput}**`, ephemeral: true });
     const item = WEAPON_ITEMS[key];
     setWeaponStock(key, qty);
-    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم تعيين الستوك").addFields({ name: `${item.emoji} ${item.name}`, value: `${qty.toLocaleString()} حبة`, inline: true }).setTimestamp()], ephemeral: true });
+    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم تعيين الستوك").addFields({ name: `${item.emoji} ${item.name}`, value: `${qty.toLocaleString("en-US")} حبة`, inline: true }).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wadmin_add_res") {
@@ -2505,7 +2728,7 @@ async function handleModal(interaction: any) {
     if (!acc) return interaction.reply({ content: `❌ لم يُعثر على حساب برقم **${iban}**.`, ephemeral: true });
     const item = WEAPON_ITEMS[key];
     addResources(iban, key, qty);
-    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تمت الإضافة").addFields({ name: "الحساب", value: `#${iban} — ${acc.name}`, inline: true }, { name: "المورد", value: `${item.emoji} ${item.name}`, inline: true }, { name: "الكمية", value: `+${qty}`, inline: true }).setTimestamp()], ephemeral: true });
+    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تمت الإضافة").addFields({ name: "الحساب", value: `#${iban} — ${acc.name}`, inline: true }, { name: "المورد", value: `${item.emoji} ${item.name}`, inline: true }, { name: "الكمية", value: `+${qty}`, inline: true }).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wadmin_remove_res") {
@@ -2521,8 +2744,8 @@ async function handleModal(interaction: any) {
     if (!acc) return interaction.reply({ content: `❌ لم يُعثر على حساب برقم **${iban}**.`, ephemeral: true });
     const item = WEAPON_ITEMS[key];
     const result = removeResources(iban, key, qty);
-    if (!result.success) return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل السحب").setDescription(result.error!)], ephemeral: true });
-    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم السحب").addFields({ name: "الحساب", value: `#${iban} — ${acc.name}`, inline: true }, { name: "المورد", value: `${item.emoji} ${item.name}`, inline: true }, { name: "الكمية", value: `-${qty}`, inline: true }).setTimestamp()], ephemeral: true });
+    if (!result.success) return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("❌ فشل السحب").setDescription(result.error!)] , ephemeral: true });
+    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم السحب").addFields({ name: "الحساب", value: `#${iban} — ${acc.name}`, inline: true }, { name: "المورد", value: `${item.emoji} ${item.name}`, inline: true }, { name: "الكمية", value: `-${qty}`, inline: true }).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wadmin_view_inv") {
@@ -2532,8 +2755,8 @@ async function handleModal(interaction: any) {
     const acc  = getAccountById(iban);
     if (!acc) return interaction.reply({ content: `❌ لم يُعثر على حساب برقم **${iban}**.`, ephemeral: true });
     const inv = acc.inventory ?? {};
-    const lines = Object.entries(WEAPON_ITEMS).map(([k, v]) => `${v.emoji} **${v.name}**: ${(inv[k] ?? 0).toLocaleString()} حبة`).join("\n");
-    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle(`🗄️ مخزون #${iban} — ${acc.name}`).setDescription(lines).setTimestamp()], ephemeral: true });
+    const lines = Object.entries(WEAPON_ITEMS).map(([k, v]) => `${v.emoji} **${v.name}**: ${(inv[k] ?? 0).toLocaleString("en-US")} حبة`).join("\n");
+    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle(`🗄️ مخزون #${iban} — ${acc.name}`).setDescription(lines).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wtransfer_weapon") {
@@ -2568,10 +2791,10 @@ async function handleModal(interaction: any) {
     if (logChannelId) {
       const logCh = await client.channels.fetch(logChannelId).catch(() => null);
       if (logCh && logCh.isTextBased()) {
-        await (logCh as any).send({ embeds: [embed(DARK_BLUE).setTitle("🔫 تحويل سلاح").addFields({ name: "المرسِل", value: `<@${user.id}> (#${account.id})`, inline: true }, { name: "المستلم", value: `<@${toAcc.userId}> (#${toIban})`, inline: true }, { name: "السلاح", value: `🔫 ${w.name}`, inline: false }, { name: "الكمية", value: `${qty}`, inline: true }).setTimestamp()] }).catch(() => {});
+        await (logCh as any).send({ embeds: [embed(DARK_BLUE).setTitle("🔫 تحويل سلاح").addFields({ name: "المرسِل", value: `<@${user.id}> (#${formatIBAN(account.id)})`, inline: true }, { name: "المستلم", value: `<@${toAcc.userId}> (#${toIban})`, inline: true }, { name: "السلاح", value: `🔫 ${w.name}`, inline: false }, { name: "الكمية", value: `${qty}`, inline: true }).setTimestamp()] }).catch(() => {});
       }
     }
-    return interaction.reply({ embeds: [embed(GREEN).setTitle("✅ تم تحويل السلاح").addFields({ name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `${qty}`, inline: true }, { name: "إلى", value: `<@${toAcc.userId}> (#${toIban})`, inline: true }).setTimestamp()], ephemeral: true });
+    return interaction.reply({ embeds: [embed(GREEN).setTitle("✅ تم تحويل السلاح").addFields({ name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `${qty}`, inline: true }, { name: "إلى", value: `<@${toAcc.userId}> (#${toIban})`, inline: true }).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wadmin_view_weapons") {
@@ -2617,7 +2840,7 @@ async function handleModal(interaction: any) {
     const w = CRAFTABLE_WEAPONS[weaponKey];
     const targetUser = await client.users.fetch(targetUserId).catch(() => null);
     if (targetUser) await targetUser.send({ embeds: [embed(DARK_BLUE).setTitle("🎁 وصلك سلاح!").addFields({ name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `+${qty}`, inline: true }).setTimestamp()] }).catch(() => {});
-    return interaction.reply({ embeds: [embed(GREEN).setTitle("✅ تم إعطاء السلاح").addFields({ name: "المستخدم", value: `<@${targetUserId}>`, inline: true }, { name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `+${qty}`, inline: true }).setTimestamp()], ephemeral: true });
+    return interaction.reply({ embeds: [embed(GREEN).setTitle("✅ تم إعطاء السلاح").addFields({ name: "المستخدم", value: `<@${targetUserId}>`, inline: true }, { name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `+${qty}`, inline: true }).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wadmin_take_weapon") {
@@ -2641,7 +2864,7 @@ async function handleModal(interaction: any) {
     const w = CRAFTABLE_WEAPONS[weaponKey];
     const targetUser = await client.users.fetch(targetUserId).catch(() => null);
     if (targetUser) await targetUser.send({ embeds: [embed(RED).setTitle("🔻 تم سحب سلاح منك").addFields({ name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `-${qty}`, inline: true }).setTimestamp()] }).catch(() => {});
-    return interaction.reply({ embeds: [embed(RED).setTitle("✅ تم سحب السلاح").addFields({ name: "المستخدم", value: `<@${targetUserId}>`, inline: true }, { name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `-${qty}`, inline: true }).setTimestamp()], ephemeral: true });
+    return interaction.reply({ embeds: [embed(RED).setTitle("✅ تم سحب السلاح").addFields({ name: "المستخدم", value: `<@${targetUserId}>`, inline: true }, { name: "السلاح", value: `🔫 ${w.name}`, inline: true }, { name: "الكمية", value: `-${qty}`, inline: true }).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wadmin_transfer_log") {
@@ -2649,7 +2872,7 @@ async function handleModal(interaction: any) {
     if (!isAdmin(m)) return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
     const channelId = interaction.fields.getTextInputValue("channel_id").trim();
     updateSettings({ weaponTransferLogChannelId: channelId } as any);
-    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم حفظ قناة لوق تحويل الأسلحة").addFields({ name: "القناة", value: `<#${channelId}>`, inline: true }).setTimestamp()], ephemeral: true });
+    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم حفظ قناة لوق تحويل الأسلحة").addFields({ name: "القناة", value: `<#${channelId}>`, inline: true }).setTimestamp()] , ephemeral: true });
   }
 
   if (customId === "modal_wadmin_activation_log") {
@@ -2657,7 +2880,99 @@ async function handleModal(interaction: any) {
     if (!isAdmin(m)) return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
     const channelId = interaction.fields.getTextInputValue("channel_id").trim();
     updateSettings({ weaponActivationLogChannelId: channelId });
-    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم حفظ قناة لوق التفعيل").addFields({ name: "القناة", value: `<#${channelId}>`, inline: true }).setTimestamp()], ephemeral: true });
+    return interaction.reply({ embeds: [embed(DARK_BLUE).setTitle("✅ تم حفظ قناة لوق التفعيل").addFields({ name: "القناة", value: `<#${channelId}>`, inline: true }).setTimestamp()] , ephemeral: true });
+  }
+
+  if (customId === "modal_cancel_violation") {
+    const freshMember = await guild?.members.fetch(user.id).catch(() => null);
+    if (!isAdmin(freshMember as GuildMember))
+      return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
+    const violationId = interaction.fields.getTextInputValue("violation_id").trim();
+    const cancelReason = interaction.fields.getTextInputValue("reason").trim();
+    const result = cancelViolation(violationId, user.id);
+    if (!result.success)
+      return interaction.reply({ embeds: [embed(RED).setTitle("❌ فشل الإلغاء").setDescription(result.error ?? "خطأ غير معروف")] , ephemeral: true });
+    const allV = getAllViolations(100);
+    const v = allV.find(x => x.id === violationId);
+    const targetUser = v ? await client.users.fetch(v.targetUserId).catch(() => null) : null;
+    if (targetUser) {
+      await targetUser.send({ embeds: [embed(DARK_BLUE).setTitle("✅ تم إلغاء مخالفة بحقك").addFields({ name: "رقم المخالفة", value: `\`${violationId}\``, inline: true }, { name: "سبب الإلغاء", value: cancelReason, inline: false }).setTimestamp()] }).catch(() => {});
+    }
+    return interaction.reply({ embeds: [embed(GREEN).setTitle("✅ تم إلغاء المخالفة").addFields({ name: "رقم المخالفة", value: `\`${violationId}\``, inline: true }, { name: "سبب الإلغاء", value: cancelReason, inline: false }).setTimestamp()] , ephemeral: true });
+  }
+
+  if (customId === "modal_issue_violation") {
+    const freshMember = await guild?.members.fetch(user.id).catch(() => null);
+    if (!isAdmin(freshMember as GuildMember))
+      return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
+    const targetIban = interaction.fields.getTextInputValue("target_iban").trim();
+    const amountRaw = interaction.fields.getTextInputValue("amount").trim();
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    const amount = parseInt(amountRaw.replace(/,/g, ""));
+    if (isNaN(amount) || amount <= 0)
+      return interaction.reply({ content: "❌ قيمة المخالفة غير صحيحة.", ephemeral: true });
+    const targetAccount = getAccountById(targetIban);
+    if (!targetAccount)
+      return interaction.reply({ content: `❌ لم يُعثر على حساب بإيبان **${targetIban}**.`, ephemeral: true });
+    const violation = issueViolation(targetAccount.userId, targetAccount.id, amount, reason, user.id);
+    const targetUser = await client.users.fetch(targetAccount.userId).catch(() => null);
+    if (targetUser) {
+      await targetUser.send({
+        embeds: [embed(RED)
+          .setTitle("🚨 تم تحرير مخالفة بحقك")
+          .setDescription("تم إصدار مخالفة مالية ضدك. يرجى التسديد خلال **24 ساعة** عبر قائمة البنك.")
+          .addFields(
+            { name: "رقم المخالفة", value: `\`${violation.id}\``, inline: true },
+            { name: "القيمة", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
+            { name: "السبب", value: reason, inline: false },
+            { name: "⚠️ تنبيه", value: "في حال عدم التسديد خلال 24 ساعة سيتم تسجيلك كمتهرب من المخالفة.", inline: false },
+          )
+          .setTimestamp()],
+      }).catch(() => {});
+    }
+    return interaction.reply({
+      embeds: [embed(GREEN)
+        .setTitle("✅ تم تحرير المخالفة")
+        .addFields(
+          { name: "رقم المخالفة", value: `\`${violation.id}\``, inline: true },
+          { name: "المخالَف", value: `<@${targetAccount.userId}> (إيبان: ${targetIban})`, inline: true },
+          { name: "القيمة", value: `${amount.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "السبب", value: reason, inline: false },
+        )
+        .setFooter({ text: "تم إرسال إشعار للمخالَف" })
+        .setTimestamp()],
+      ephemeral: true,
+    });
+  }
+
+  if (customId === "modal_pay_single_violation") {
+    const violationId = interaction.fields.getTextInputValue("violation_id").trim();
+    const account = getAccountByUserId(user.id);
+    if (!account)
+      return interaction.reply({ content: "❌ لا يوجد لديك حساب.", ephemeral: true });
+    const allViolations = getViolationsByUserId(user.id);
+    const target = allViolations.find((v) => v.id === violationId);
+    if (!target)
+      return interaction.reply({ content: `❌ لم يُعثر على مخالفة برقم \`${violationId}\` تخصك.`, ephemeral: true });
+    if (target.status !== "unpaid")
+      return interaction.reply({ content: "❌ هذه المخالفة مسددة أو منتهية بالفعل.", ephemeral: true });
+    const result = payViolation(violationId, user.id);
+    if (!result.success)
+      return interaction.reply({
+        embeds: [embed(RED).setTitle("❌ فشل التسديد").setDescription(result.error ?? "خطأ غير معروف")],
+        ephemeral: true,
+      });
+    return interaction.reply({
+      embeds: [embed(GREEN)
+        .setTitle("✅ تم تسديد المخالفة")
+        .addFields(
+          { name: "رقم المخالفة", value: `\`${violationId}\``, inline: true },
+          { name: "المبلغ المسدد", value: `${target.amount.toLocaleString("en-US")} ريال`, inline: true },
+          { name: "رصيد بنكك الجديد", value: `${(account.balance - target.amount).toLocaleString("en-US")} ريال`, inline: true },
+        )
+        .setTimestamp()],
+      ephemeral: true,
+    });
   }
 
   if (customId === "modal_delete_account") {
@@ -2683,12 +2998,12 @@ async function handleModal(interaction: any) {
     const logEmbed = embed(DARK_BLUE)
       .setTitle("🗑️ تم حذف حساب بنكي")
       .addFields(
-        { name: "رقم الحساب", value: `**${accountId}**`, inline: true },
+        { name: "رقم الحساب", value: `**${formatIBAN(accountId)}**`, inline: true },
         { name: "الاسم", value: account.name, inline: true },
         { name: "روبلوكس", value: account.robloxUsername || "—", inline: true },
         { name: "المستخدم", value: `<@${account.userId}>`, inline: true },
-        { name: "💵 كاش كان", value: `${(account.cash ?? 0).toLocaleString()} ريال`, inline: true },
-        { name: "🏦 بنك كان", value: `${account.balance.toLocaleString()} ريال`, inline: true },
+        { name: "💵 كاش كان", value: `${(account.cash ?? 0).toLocaleString("en-US")} ريال`, inline: true },
+        { name: "🏦 بنك كان", value: `${account.balance.toLocaleString("en-US")} ريال`, inline: true },
         { name: "حُذف بواسطة", value: `<@${user.id}>`, inline: true },
       )
       .setTimestamp();
@@ -2697,7 +3012,7 @@ async function handleModal(interaction: any) {
       if (logCh) await logCh.send({ embeds: [logEmbed] }).catch(() => {});
     }
     return interaction.reply({
-      content: `✅ تم حذف الحساب **#${accountId}** (${account.name}) بنجاح.`,
+      content: `✅ تم حذف الحساب **#${formatIBAN(accountId)}** (${account.name}) بنجاح.`,
       ephemeral: true,
     });
   }
@@ -2710,5 +3025,6 @@ export async function startBot() {
     console.error("❌ DISCORD_BOT_TOKEN غير موجود!");
     return;
   }
+  setupCronJobs();
   await client.login(token);
 }
