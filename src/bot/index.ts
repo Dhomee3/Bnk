@@ -296,8 +296,8 @@ client.once("clientReady", async (readyClient) => {
   readyClient.user.setPresence({
     activities: [
       {
-        name: "Powered By M7md .",
-        type: ActivityType.Playing,
+        name: "Powered By FTRP .",
+        type: ActivityType.Streaming,
       },
     ],
     status: "online",
