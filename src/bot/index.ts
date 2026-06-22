@@ -131,7 +131,7 @@ const PURPLE = 0x6a1b9a;
 const ROBBERY_CONFIG: Record<string, { name: string; emoji: string; amount: number; policeMin: number; policeMax: number; civilMin: number; civilMax: number; civilLabel: string }> = {
   atm:     { name: "صرافة (ATM)", emoji: "🏧", amount: 3000, policeMin: 2, policeMax: 4, civilMin: 1, civilMax: 4, civilLabel: "المواطنين" },
   cashier: { name: "كاشير",       emoji: "🏪", amount: 2000, policeMin: 2, policeMax: 6, civilMin: 1, civilMax: 5, civilLabel: "المواطنين" },
-  house:   { name: "منزل",        emoji: "🏠", amount: 5000, policeMin: 4, policeMax: 6, civilMin: 2, civilMax: 6, civilLabel: "المجرمين" },
+  house:   { name: "منزل",        emoji: "🏠", amount: 4000, policeMin: 4, policeMax: 6, civilMin: 2, civilMax: 6, civilLabel: "المجرمين" },
 };
 type RobberyType = "atm" | "cashier" | "house";
 
