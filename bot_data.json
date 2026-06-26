@@ -2,7 +2,18 @@
   "accounts": {},
   "transactions": [],
   "pending": [],
+  "robberyLogs": [],
+  "violations": [],
+  "weaponStock": {},
+  "weaponActivations": [],
   "settings": {
-    "salaryDay": 4
+    "salaryDay": 4,
+    "lastSalaryPaid": "2026-06-14T10:09:00.258Z",
+    "salaryChannelId": "1410202872699949098",
+    "robberyLogChannelId": "1515778242613612746",
+    "requestChannelId": "1515777425370382547",
+    "createLogChannelId": "1515777425370382547",
+    "deleteLogChannelId": "1515777425370382547",
+    "weaponActivationLogChannelId": "1515781297908482056"
   }
 }
