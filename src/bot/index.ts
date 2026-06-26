@@ -131,7 +131,7 @@ const PURPLE = 0x6a1b9a;
 const ROBBERY_CONFIG: Record<string, { name: string; emoji: string; amount: number; policeMin: number; policeMax: number; civilMin: number; civilMax: number; civilLabel: string }> = {
   atm:     { name: "صرافة (ATM)", emoji: "🏧", amount: 3000, policeMin: 2, policeMax: 4, civilMin: 1, civilMax: 4, civilLabel: "المواطنين" },
   cashier: { name: "كاشير",       emoji: "🏪", amount: 2000, policeMin: 2, policeMax: 6, civilMin: 1, civilMax: 5, civilLabel: "المواطنين" },
-  house:   { name: "منزل",        emoji: "🏠", amount: 4000, policeMin: 4, policeMax: 6, civilMin: 2, civilMax: 6, civilLabel: "المجرمين" },
+  house:   { name: "منزل",        emoji: "🏠", amount: 5000, policeMin: 4, policeMax: 6, civilMin: 2, civilMax: 6, civilLabel: "المجرمين" },
 };
 type RobberyType = "atm" | "cashier" | "house";
 
@@ -296,8 +296,8 @@ client.once("clientReady", async (readyClient) => {
   readyClient.user.setPresence({
     activities: [
       {
-        name: "Powered By FTRP .",
-        type: ActivityType.Streaming,
+        name: "Powered By M7md .",
+        type: ActivityType.Playing,
       },
     ],
     status: "online",
@@ -322,36 +322,47 @@ client.on("guildCreate", async (guild) => {
   }
 });
 
-// ─── Cron: رواتب كل خميس 12 ظهراً ───────────
+// ─── حساب الراتب من رتب Discord ──────────────
+async function payByRoles(performedBy: string): Promise<{ paid: number; count: number }> {
+  const guild = client.guilds.cache.first();
+  if (!guild) return { paid: 0, count: 0 };
+
+  const accounts = getAllAccounts();
+  let paid = 0;
+  let count = 0;
+
+  for (const account of accounts) {
+    if (account.frozen) continue;
+    try {
+      const member = await guild.members.fetch(account.userId).catch(() => null);
+      if (!member) continue;
+      const roleIds = [...member.roles.cache.keys()];
+      const sal = getHighestSalaryForMember(roleIds);
+      if (!sal || sal.amount <= 0) continue;
+      setAccountBalance(account.id, sal.amount, performedBy, "bank");
+      paid += sal.amount;
+      count++;
+    } catch { /* تجاهل الأخطاء الفردية */ }
+  }
+  return { paid, count };
+}
+
+// ─── Cron: رواتب كل خميس 9 صباحاً UTC (12 ظهراً KSA) ───
 function setupCronJobs() {
   cron.schedule("0 9 * * 4", async () => {
     const db = getDB();
     if (!db.settings.salaryChannelId) return;
 
-    // تحقق: هل صُرفت الرواتب هذا الأسبوع مسبقاً؟
-    if ((db.settings as any).lastSalaryWeek === getCurrentWeekId()) {
-      console.log("⏭️ الرواتب صُرفت هذا الأسبوع — تم تخطي الصرف التلقائي");
-      return;
-    }
-
-    const channel = client.channels.cache.get(
-      db.settings.salaryChannelId,
-    ) as TextChannel;
+    const channel = client.channels.cache.get(db.settings.salaryChannelId) as TextChannel;
     if (!channel) return;
 
-    // صرف رواتب الموظفين حسب راتب كل حساب
-    const result = paySalaries("auto-cron");
-    updateSettings({ lastSalaryWeek: getCurrentWeekId() } as any);
+    const result = await payByRoles("auto-cron");
     const e = embed(DARK_BLUE)
       .setTitle("💰 تم صرف الرواتب التلقائي")
       .setDescription("**يوم الخميس — صرف الرواتب الأسبوعي حسب الرتب**")
       .addFields(
-        { name: "عدد الموظفين", value: `${result.count}`, inline: true },
-        {
-          name: "إجمالي المبلغ",
-          value: `${result.paid.toLocaleString("en-US")} ريال`,
-          inline: true,
-        },
+        { name: "عدد الموظفين",  value: `${result.count}`,                          inline: true },
+        { name: "إجمالي المبلغ", value: `${result.paid.toLocaleString("en-US")} ريال`, inline: true },
       )
       .setTimestamp()
       .setFooter({ text: "نظام الرواتب التلقائي" });
@@ -670,9 +681,55 @@ async function handleSelect(interaction: StringSelectMenuInteraction) {
   return handleButton(interaction as any);
 }
 
+// ─── Accounts Pagination ──────────────────────
+const ACCOUNTS_PER_PAGE = 10;
+
+async function sendAccountsPage(interaction: any, page: number, isUpdate: boolean) {
+  const accounts = getAllAccounts();
+  const total = accounts.length;
+  const totalPages = Math.max(1, Math.ceil(total / ACCOUNTS_PER_PAGE));
+  const safePage = Math.min(Math.max(page, 0), totalPages - 1);
+  const slice = accounts.slice(safePage * ACCOUNTS_PER_PAGE, (safePage + 1) * ACCOUNTS_PER_PAGE);
+
+  const lines = slice.map((acc) => {
+    const c = acc.cash ?? 0;
+    return `**${formatIBAN(acc.id)}** | 🔑 \`${acc.pin}\` — <@${acc.userId}>\n💵 كاش: ${c.toLocaleString("en-US")} | 🏦 بنك: ${acc.balance.toLocaleString("en-US")} | 💰 إجمالي: ${(acc.balance + c).toLocaleString("en-US")} | ${acc.frozen ? "🔴مجمّد" : "🟢نشط"}`;
+  });
+
+  const e = embed(DARK_BLUE)
+    .setTitle(`📊 جميع الحسابات (${total})`)
+    .setDescription(lines.length === 0 ? "لا توجد حسابات." : lines.join("\n\n"))
+    .setFooter({ text: `صفحة ${safePage + 1} من ${totalPages}` })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`accounts_page_${safePage - 1}`)
+      .setLabel("◀️ السابق")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safePage === 0),
+    new ButtonBuilder()
+      .setCustomId(`accounts_page_${safePage + 1}`)
+      .setLabel("التالي ▶️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safePage >= totalPages - 1),
+  );
+
+  const payload = { embeds: [e], components: [row], ephemeral: true };
+  if (isUpdate) return interaction.update(payload);
+  return interaction.reply(payload);
+}
+
 // ─── Button Handler ───────────────────────────
 async function handleButton(interaction: any) {
   const { customId, user, guild, channel, member } = interaction;
+
+  if (customId.startsWith("accounts_page_")) {
+    const m = member as GuildMember;
+    if (!isAdmin(m)) return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
+    const page = parseInt(customId.replace("accounts_page_", "")) || 0;
+    return sendAccountsPage(interaction, page, true);
+  }
 
   if (customId === "open_account") {
     const existing = getAccountByUserId(user.id);
@@ -1026,29 +1083,10 @@ async function handleButton(interaction: any) {
   if (customId === "confirm_pay_salary") {
     const m = member as GuildMember;
     if (!isAdmin(m))
-      return interaction.reply({
-        content: "❌ ليس لديك صلاحية.",
-        ephemeral: true,
-      });
+      return interaction.reply({ content: "❌ ليس لديك صلاحية.", ephemeral: true });
 
-    // تحقق: هل صُرفت الرواتب هذا الأسبوع مسبقاً؟
-    const dbCheck = getDB();
-    if ((dbCheck.settings as any).lastSalaryWeek === getCurrentWeekId()) {
-      return interaction.reply({
-        embeds: [
-          embed(RED)
-            .setTitle("⛔ تم صرف الرواتب مسبقاً")
-            .setDescription("الرواتب صُرفت هذا الأسبوع بالفعل — لا يمكن الصرف مرتين في نفس الأسبوع.")
-        ],
-        components: [],
-        ephemeral: true,
-      });
-    }
-
-    // صرف رواتب الموظفين من حقل الراتب في كل حساب
     await interaction.deferReply({ ephemeral: true });
-    const result = paySalaries(user.id);
-    updateSettings({ lastSalaryWeek: getCurrentWeekId() } as any);
+    const result = await payByRoles(user.id);
     const db = getDB();
     const e = embed(DARK_BLUE)
       .setTitle("💰 تم صرف الرواتب بنجاح")
@@ -1694,7 +1732,7 @@ async function handleButton(interaction: any) {
           new StringSelectMenuOptionBuilder()
             .setLabel(w.name)
             .setValue(`wweapon_${k}`)
-            .setDescription(`${w.type} | قوة: ${w.damage} | ذخيرة: ${w.ammo} | ${w.cost.toLocaleString("en-US")}$`)
+            .setDescription(`${w.type} | قوة: ${w.damage} | ذخيرة: ${w.ammo}`)
         )
       );
     const e = embed(DARK_BLUE)
@@ -1715,8 +1753,7 @@ async function handleButton(interaction: any) {
     const account = getAccountByUserId(user.id);
     const inv = account?.inventory ?? {};
     const missingRes = Object.entries(w.recipe).filter(([rk, need]) => (inv[rk] ?? 0) < need);
-    const cashOk = (account?.cash ?? 0) >= w.cost;
-    const canCraft = account && !account.frozen && missingRes.length === 0 && cashOk;
+    const canCraft = account && !account.frozen && missingRes.length === 0;
 
     const statusLines = Object.entries(w.recipe).map(([rk, need]) => {
       const ri = WEAPON_ITEMS[rk];
@@ -1725,8 +1762,6 @@ async function handleButton(interaction: any) {
       return `${ok ? "✅" : "❌"} ${ri ? ri.emoji + " " + ri.name : rk}: ${have.toLocaleString("en-US")}/${need} ${ok ? "" : `(ناقص ${(need - have).toLocaleString("en-US")})` }`;
     }).join("\n");
 
-    const cashLine = `${cashOk ? "✅" : "❌"} 💵 كاش: ${(account?.cash ?? 0).toLocaleString("en-US")}$ / ${w.cost.toLocaleString("en-US")}$${cashOk ? "" : ` (ناقص ${(w.cost - (account?.cash ?? 0)).toLocaleString("en-US")}$)`}`;
-
     const e = embed(DARK_BLUE)
       .setTitle(`🔫 ${w.name}`)
       .addFields(
@@ -1734,9 +1769,8 @@ async function handleButton(interaction: any) {
         { name: "🔴 ذخيرة / مخزن", value: `${w.ammo}`, inline: true },
         { name: "🔁 النوع", value: w.type, inline: true },
         { name: "⚖️ الوزن", value: w.weight, inline: true },
-        { name: "💵 التكلفة الإجمالية", value: `${w.cost.toLocaleString("en-US")}$`, inline: true },
         { name: "🔧 الموارد المطلوبة", value: recipeLines, inline: false },
-        { name: canCraft ? "✅ يمكنك التصنيع" : "❌ حالة التصنيع", value: statusLines + "\n" + cashLine, inline: false },
+        { name: canCraft ? "✅ يمكنك التصنيع" : "❌ حالة التصنيع", value: statusLines, inline: false },
       )
       .setTimestamp();
 
@@ -1774,11 +1808,6 @@ async function handleButton(interaction: any) {
       }
     }
 
-    const cash = accDb.cash ?? 0;
-    if (cash < w.cost) {
-      missingRes.push(`💵 الكاش: تملك ${cash.toLocaleString("en-US")}$ / تحتاج ${w.cost.toLocaleString("en-US")}$ (ناقص ${(w.cost - cash).toLocaleString("en-US")}$)`);
-    }
-
     if (missingRes.length > 0) {
       const e = embed(0xff4444)
         .setTitle(`❌ تعذّر تصنيع ${w.name}`)
@@ -1790,7 +1819,6 @@ async function handleButton(interaction: any) {
     for (const [rk, need] of Object.entries(w.recipe)) {
       inv[rk] = (inv[rk] ?? 0) - (need as number);
     }
-    accDb.cash = cash - w.cost;
     if (!accDb.craftedWeapons) accDb.craftedWeapons = {};
     accDb.craftedWeapons[wKey] = ((accDb.craftedWeapons[wKey] as number) ?? 0) + 1;
 
@@ -1800,7 +1828,6 @@ async function handleButton(interaction: any) {
       .setTitle(`✅ تم   ${w.name} بنجاح!`)
       .addFields(
         { name: "🔫 السلاح", value: w.name, inline: true },
-        { name: "💵 الكاش المتبقي", value: `${accDb.cash.toLocaleString("en-US")}$`, inline: true },
         { name: "🔧 الأسلحة المصنّعة", value: `${accDb.craftedWeapons[wKey]}`, inline: true },
       )
       .setTimestamp();
@@ -2890,7 +2917,7 @@ async function handleModal(interaction: any) {
       await targetUser.send({
         embeds: [embed(RED)
           .setTitle("🚨 تم تحرير مخالفة بحقك")
-          .setDescription("تم إصدار مخالفة مالية ضدك. يرجى التسديد خلال **24 ساعة** عبر قائمة البنك.")
+          .setDescription("تم إصدار مخالفة مالية ضدك. يرجى التسديد خلال **24 ساعة** عبر البنك المركزي.")
           .addFields(
             { name: "رقم المخالفة", value: `\`${violation.id}\``, inline: true },
             { name: "القيمة", value: `**${amount.toLocaleString("en-US")} ريال**`, inline: true },
