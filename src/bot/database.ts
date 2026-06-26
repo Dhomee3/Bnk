@@ -787,8 +787,8 @@ export function payRoleSalaries(
 
 // ─── Format IBAN ───────────────────────────────
 export function formatIBAN(id: string): string {
-  const num = id.toString().padStart(6, "0");
-  return `SA${num.slice(0, 2)}-${num.slice(2, 4)}-${num.slice(4)}`;
+  const num = id.toString().padStart(8, "0");
+  return `${num.slice(0, 4)} ${num.slice(4)}`;
 }
 
 // ─── Violations ────────────────────────────────
