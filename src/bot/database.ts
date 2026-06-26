@@ -1,9 +1,55 @@
-import fs from "fs";
+وimport fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { MongoClient, Collection } from "mongodb";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, "../../bot_data.json");
+
+// ─── MongoDB Setup ─────────────────────────────
+const MONGO_URI = process.env.MONGODB_URI ?? "";
+const MONGO_DB   = "ftrp";
+const MONGO_COL  = "bot_data";
+
+let _mongoCol: Collection | null = null;
+
+async function getCol(): Promise<Collection | null> {
+  if (!MONGO_URI) return null;
+  if (_mongoCol) return _mongoCol;
+  try {
+    const client = new MongoClient(MONGO_URI);
+    await client.connect();
+    _mongoCol = client.db(MONGO_DB).collection(MONGO_COL);
+    console.log("✅ MongoDB متصل");
+    return _mongoCol;
+  } catch (e) {
+    console.error("❌ خطأ في الاتصال بـ MongoDB:", e);
+    return null;
+  }
+}
+
+// تحميل من MongoDB عند بدء التشغيل إذا كان الملف المحلي فارغاً
+export async function initDB(): Promise<void> {
+  const col = await getCol();
+  if (!col) return;
+  try {
+    const local = loadDB();
+    const hasAccounts = Object.keys(local.accounts).length > 0;
+    if (!hasAccounts) {
+      const doc = await col.findOne({ _id: "main" as any });
+      if (doc?.data) {
+        fs.writeFileSync(DB_PATH, JSON.stringify(doc.data, null, 2));
+        console.log("✅ تم تحميل البيانات من MongoDB");
+      }
+    } else {
+      // محلي فيه بيانات → رفعها على MongoDB
+      await col.updateOne({ _id: "main" as any }, { $set: { data: local } }, { upsert: true });
+      console.log("✅ تم مزامنة البيانات المحلية إلى MongoDB");
+    }
+  } catch (e) {
+    console.error("❌ خطأ في initDB:", e);
+  }
+}
 
 export interface Account {
   id: string;
@@ -19,18 +65,6 @@ export interface Account {
   salary: number;
   createdAt: string;
   inventory?: Record<string, number>;
-}
-
-export interface Violation {
-  id: string;
-  targetUserId: string;
-  targetAccountId: string;
-  amount: number;
-  reason: string;
-  issuedBy: string;
-  issuedAt: string;
-  status: "unpaid" | "paid" | "evaded";
-  paidAt?: string;
 }
 
 export interface WeaponActivation {
@@ -83,6 +117,20 @@ export interface RobberyLog {
   performedBy: string;
 }
 
+export interface Violation {
+  id: string;
+  targetUserId: string;
+  targetAccountId: string;
+  amount: number;
+  reason: string;
+  status: "unpaid" | "paid" | "evaded" | "cancelled";
+  issuedBy: string;
+  issuedAt: string;
+  expiresAt: string;
+  paidAt?: string;
+  cancelledBy?: string;
+}
+
 export interface BotDB {
   accounts: Record<string, Account>;
   transactions: Transaction[];
@@ -118,9 +166,9 @@ function loadDB(): BotDB {
   }
   const db = JSON.parse(fs.readFileSync(DB_PATH, "utf-8")) as BotDB;
   if (!db.robberyLogs) db.robberyLogs = [];
-  if (!db.violations) db.violations = [];
   if (!db.weaponStock) db.weaponStock = {};
   if (!db.weaponActivations) db.weaponActivations = [];
+  if (!db.violations) db.violations = [];
   for (const acc of Object.values(db.accounts)) {
     if ((acc as any).cash === undefined) (acc as any).cash = 0;
     if ((acc as any).name === undefined) (acc as any).name = acc.username;
@@ -134,6 +182,13 @@ function loadDB(): BotDB {
 
 export function saveDB(db: BotDB): void {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+  // حفظ async على MongoDB بدون انتظار
+  getCol().then((col) => {
+    if (!col) return;
+    col.updateOne({ _id: "main" as any }, { $set: { data: db } }, { upsert: true }).catch((e) =>
+      console.error("❌ خطأ في حفظ MongoDB:", e)
+    );
+  });
 }
 
 export function getDB(): BotDB {
@@ -142,20 +197,10 @@ export function getDB(): BotDB {
 
 export function generateAccountNumber(): string {
   const db = loadDB();
-  const existing = new Set(Object.keys(db.accounts));
-  let id: string;
-  do {
-    const a = Math.floor(1000 + Math.random() * 9000).toString();
-    const b = Math.floor(1000 + Math.random() * 9000).toString();
-    id = `${a}${b}`;
-  } while (existing.has(id));
-  return id;
-}
-
-export function formatIBAN(id: string): string {
-  const clean = id.replace(/\s/g, "");
-  if (clean.length === 8) return `${clean.slice(0, 4)} ${clean.slice(4)}`;
-  return id;
+  const existing = Object.values(db.accounts).map((a) => parseInt(a.id));
+  let num = 1001;
+  while (existing.includes(num)) num++;
+  return num.toString();
 }
 
 export function createAccount(
@@ -204,8 +249,7 @@ export function getAccountByUserId(userId: string): Account | null {
 
 export function getAccountById(accountId: string): Account | null {
   const db = loadDB();
-  const clean = accountId.replace(/\s/g, "");
-  return db.accounts[clean] || db.accounts[accountId] || null;
+  return db.accounts[accountId] || null;
 }
 
 export function transfer(
@@ -336,7 +380,7 @@ export function setAccountBalance(
     type: "salary",
     toAccount: accountId,
     amount,
-    description: `إضافة ${amount.toLocaleString("en-US")} يدوياً (${label}) إلى حساب ${accountId}`,
+    description: `إضافة ${amount.toLocaleString()} يدوياً (${label}) إلى حساب ${accountId}`,
     timestamp: new Date().toISOString(),
     performedBy,
   });
@@ -355,7 +399,7 @@ export function removeBalance(
   if (!account) return { success: false, error: "الحساب غير موجود" };
   const label = target === "cash" ? "كاش" : "بنك";
   const current = target === "cash" ? (account.cash ?? 0) : account.balance;
-  if (current < amount) return { success: false, error: `الرصيد الحالي (${current.toLocaleString("en-US")}) أقل من المبلغ المطلوب سحبه` };
+  if (current < amount) return { success: false, error: `الرصيد الحالي (${current.toLocaleString()}) أقل من المبلغ المطلوب سحبه` };
   if (target === "cash") {
     account.cash = (account.cash ?? 0) - amount;
   } else {
@@ -366,7 +410,7 @@ export function removeBalance(
     type: "transfer",
     fromAccount: accountId,
     amount,
-    description: `خصم ${amount.toLocaleString("en-US")} يدوياً (${label}) من حساب ${accountId}`,
+    description: `خصم ${amount.toLocaleString()} يدوياً (${label}) من حساب ${accountId}`,
     timestamp: new Date().toISOString(),
     performedBy,
   });
@@ -384,7 +428,7 @@ export function deposit(
   if (!account) return { success: false, error: "الحساب غير موجود" };
   if (account.frozen) return { success: false, error: "الحساب مجمّد" };
   const cash = account.cash ?? 0;
-  if (cash < amount) return { success: false, error: `الكاش الحالي (${cash.toLocaleString("en-US")}) أقل من المبلغ` };
+  if (cash < amount) return { success: false, error: `الكاش الحالي (${cash.toLocaleString()}) أقل من المبلغ` };
   account.cash = cash - amount;
   account.balance += amount;
   db.transactions.push({
@@ -392,7 +436,7 @@ export function deposit(
     type: "transfer",
     toAccount: accountId,
     amount,
-    description: `إيداع ${amount.toLocaleString("en-US")} من الكاش إلى البنك`,
+    description: `إيداع ${amount.toLocaleString()} من الكاش إلى البنك`,
     timestamp: new Date().toISOString(),
     performedBy,
   });
@@ -409,7 +453,7 @@ export function withdraw(
   const account = db.accounts[accountId];
   if (!account) return { success: false, error: "الحساب غير موجود" };
   if (account.frozen) return { success: false, error: "الحساب مجمّد" };
-  if (account.balance < amount) return { success: false, error: `رصيد البنك (${account.balance.toLocaleString("en-US")}) غير كافٍ` };
+  if (account.balance < amount) return { success: false, error: `رصيد البنك (${account.balance.toLocaleString()}) غير كافٍ` };
   account.balance -= amount;
   account.cash = (account.cash ?? 0) + amount;
   db.transactions.push({
@@ -417,7 +461,7 @@ export function withdraw(
     type: "transfer",
     fromAccount: accountId,
     amount,
-    description: `سحب ${amount.toLocaleString("en-US")} من البنك إلى الكاش`,
+    description: `سحب ${amount.toLocaleString()} من البنك إلى الكاش`,
     timestamp: new Date().toISOString(),
     performedBy,
   });
@@ -431,13 +475,9 @@ export function changeAccountId(
   performedBy: string
 ): { success: boolean; error?: string } {
   const db = loadDB();
-  const cleanOld = oldId.replace(/\s/g, "");
-  const cleanNew = newId.replace(/\s/g, "");
-  if (!db.accounts[cleanOld]) return { success: false, error: "الحساب غير موجود" };
-  if (db.accounts[cleanNew]) return { success: false, error: "هذا الرقم مستخدم بالفعل" };
-  if (!/^\d{8}$/.test(cleanNew)) return { success: false, error: "يجب أن يكون الإيبان 8 أرقام بصيغة: 1234 5678" };
-  oldId = cleanOld;
-  newId = cleanNew;
+  if (!db.accounts[oldId]) return { success: false, error: "الحساب غير موجود" };
+  if (db.accounts[newId]) return { success: false, error: "هذا الرقم مستخدم بالفعل" };
+  if (!/^\d{4}$/.test(newId)) return { success: false, error: "يجب أن يكون الإيبان 4 أرقام" };
   const account = { ...db.accounts[oldId], id: newId };
   db.accounts[newId] = account;
   delete db.accounts[oldId];
@@ -475,7 +515,7 @@ export function bulkAddBalance(
     total += added;
     count++;
   }
-  const label = mode === "percent" ? `${value}%` : `${value.toLocaleString("en-US")} ريال`;
+  const label = mode === "percent" ? `${value}%` : `${value.toLocaleString()} ريال`;
   const tgt = target === "cash" ? "كاش" : "بنك";
   db.transactions.push({
     id: Date.now().toString(),
@@ -509,7 +549,7 @@ export function bulkRemoveBalance(
     total += deducted;
     count++;
   }
-  const label = mode === "percent" ? `${value}%` : `${value.toLocaleString("en-US")} ريال`;
+  const label = mode === "percent" ? `${value}%` : `${value.toLocaleString()} ريال`;
   const tgt = target === "cash" ? "كاش" : "بنك";
   db.transactions.push({
     id: Date.now().toString(),
@@ -546,7 +586,7 @@ export function logRobbery(
       type: "salary",
       toAccount: payout.accountId,
       amount: payout.amount,
-      description: `غنيمة سرقة (${log.typeName}): ${payout.amount.toLocaleString("en-US")} ريال كاش — ${payout.role === "police" ? "شرطة" : "مواطن"}`,
+      description: `غنيمة سرقة (${log.typeName}): ${payout.amount.toLocaleString()} ريال كاش — ${payout.role === "police" ? "شرطة" : "مواطن"}`,
       timestamp: new Date().toISOString(),
       performedBy: log.performedBy,
     });
@@ -671,7 +711,7 @@ export function buyResource(
   if (acc.frozen)    return { success: false, error: "الحساب مجمّد" };
   const total = qty * pricePerUnit;
   if (acc.balance < total)
-    return { success: false, error: `الرصيد غير كافٍ (${acc.balance.toLocaleString("en-US")} < ${total.toLocaleString("en-US")})` };
+    return { success: false, error: `الرصيد غير كافٍ (${acc.balance.toLocaleString()} < ${total.toLocaleString()})` };
   if (!db.weaponStock) db.weaponStock = {};
   const stock = db.weaponStock[key] ?? 0;
   if (stock < qty)
@@ -685,7 +725,7 @@ export function buyResource(
     type: "transfer",
     fromAccount: accountId,
     amount: total,
-    description: `شراء ${qty} × ${key} بـ ${total.toLocaleString("en-US")} ريال`,
+    description: `شراء ${qty} × ${key} بـ ${total.toLocaleString()} ريال`,
     timestamp: new Date().toISOString(),
     performedBy: accountId,
   });
@@ -717,144 +757,6 @@ export function getWeaponActivation(id: string): WeaponActivation | null {
   return db.weaponActivations?.find((a) => a.id === id) ?? null;
 }
 
-// ─── Violations ──────────────────────────────
-
-export function issueViolation(
-  targetUserId: string,
-  targetAccountId: string,
-  amount: number,
-  reason: string,
-  issuedBy: string,
-): Violation {
-  const db = loadDB();
-  if (!db.violations) db.violations = [];
-  const violation: Violation = {
-    id: `V${Date.now()}`,
-    targetUserId,
-    targetAccountId,
-    amount,
-    reason,
-    issuedBy,
-    issuedAt: new Date().toISOString(),
-    status: "unpaid",
-  };
-  db.violations.push(violation);
-  saveDB(db);
-  return violation;
-}
-
-export function getViolationsByUserId(userId: string): Violation[] {
-  const db = loadDB();
-  return (db.violations ?? []).filter((v) => v.targetUserId === userId);
-}
-
-export function getUnpaidViolationsByUserId(userId: string): Violation[] {
-  return getViolationsByUserId(userId).filter((v) => v.status === "unpaid");
-}
-
-export function payViolation(
-  violationId: string,
-  performedBy: string,
-): { success: boolean; error?: string; violation?: Violation } {
-  const db = loadDB();
-  if (!db.violations) return { success: false, error: "لا توجد مخالفات" };
-  const v = db.violations.find((x) => x.id === violationId);
-  if (!v) return { success: false, error: "المخالفة غير موجودة" };
-  if (v.status !== "unpaid") return { success: false, error: "المخالفة مسددة أو مغلقة بالفعل" };
-  const account = db.accounts[v.targetAccountId];
-  if (!account) return { success: false, error: "الحساب غير موجود" };
-  if (account.balance < v.amount)
-    return { success: false, error: `الرصيد غير كافٍ (${account.balance.toLocaleString("en-US")} < ${v.amount.toLocaleString("en-US")})` };
-  account.balance -= v.amount;
-  v.status = "paid";
-  v.paidAt = new Date().toISOString();
-  db.transactions.push({
-    id: Date.now().toString(),
-    type: "transfer",
-    fromAccount: v.targetAccountId,
-    amount: v.amount,
-    description: `تسديد مخالفة ${v.id} — ${v.reason}`,
-    timestamp: new Date().toISOString(),
-    performedBy,
-  });
-  saveDB(db);
-  return { success: true, violation: v };
-}
-
-export function payAllViolations(
-  userId: string,
-  performedBy: string,
-): { success: boolean; paid: number; total: number; error?: string } {
-  const db = loadDB();
-  if (!db.violations) return { success: false, paid: 0, total: 0, error: "لا توجد مخالفات" };
-  const unpaid = db.violations.filter((v) => v.targetUserId === userId && v.status === "unpaid");
-  if (unpaid.length === 0) return { success: false, paid: 0, total: 0, error: "لا توجد مخالفات غير مسددة" };
-  const totalAmount = unpaid.reduce((s, v) => s + v.amount, 0);
-  const account = Object.values(db.accounts).find((a) => a.userId === userId);
-  if (!account) return { success: false, paid: 0, total: totalAmount, error: "لم يُعثر على حساب" };
-  if (account.balance < totalAmount)
-    return { success: false, paid: 0, total: totalAmount, error: `الرصيد غير كافٍ (${account.balance.toLocaleString("en-US")} < ${totalAmount.toLocaleString("en-US")})` };
-  account.balance -= totalAmount;
-  const now = new Date().toISOString();
-  for (const v of unpaid) {
-    v.status = "paid";
-    v.paidAt = now;
-  }
-  db.transactions.push({
-    id: Date.now().toString(),
-    type: "transfer",
-    fromAccount: account.id,
-    amount: totalAmount,
-    description: `تسديد ${unpaid.length} مخالفات — إجمالي ${totalAmount.toLocaleString("en-US")} ريال`,
-    timestamp: now,
-    performedBy,
-  });
-  saveDB(db);
-  return { success: true, paid: unpaid.length, total: totalAmount };
-}
-
-export function cancelViolation(
-  violationId: string,
-  cancelledBy: string,
-): { success: boolean; error?: string } {
-  const db = loadDB();
-  if (!db.violations) return { success: false, error: "لا توجد مخالفات" };
-  const v = db.violations.find((x) => x.id === violationId);
-  if (!v) return { success: false, error: "المخالفة غير موجودة" };
-  if (v.status === "paid") return { success: false, error: "المخالفة مسددة بالفعل ولا يمكن إلغاؤها" };
-  v.status = "evaded";
-  v.paidAt = new Date().toISOString();
-  db.transactions.push({
-    id: Date.now().toString(),
-    type: "transfer",
-    description: `إلغاء مخالفة ${violationId} بواسطة الإدارة`,
-    timestamp: new Date().toISOString(),
-    performedBy: cancelledBy,
-  });
-  saveDB(db);
-  return { success: true };
-}
-
-export function getAllViolations(limit = 30): Violation[] {
-  const db = loadDB();
-  return (db.violations ?? []).slice(-limit).reverse();
-}
-
-export function markExpiredViolations(): number {
-  const db = loadDB();
-  if (!db.violations) return 0;
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  let count = 0;
-  for (const v of db.violations) {
-    if (v.status === "unpaid" && new Date(v.issuedAt).getTime() < cutoff) {
-      v.status = "evaded";
-      count++;
-    }
-  }
-  if (count > 0) saveDB(db);
-  return count;
-}
-
 export function payRoleSalaries(
   salaries: { userId: string; amount: number; roleName: string }[],
   performedBy: string
@@ -873,7 +775,7 @@ export function payRoleSalaries(
       type: "salary",
       toAccount: account.id,
       amount,
-      description: `راتب ${roleName}: ${amount.toLocaleString("en-US")} ريال`,
+      description: `راتب ${roleName}: ${amount.toLocaleString()} ريال`,
       timestamp: new Date().toISOString(),
       performedBy,
     });
@@ -881,4 +783,142 @@ export function payRoleSalaries(
   db.settings.lastSalaryPaid = new Date().toISOString();
   saveDB(db);
   return { paid, count };
+}
+
+// ─── Format IBAN ───────────────────────────────
+export function formatIBAN(id: string): string {
+  const num = id.toString().padStart(6, "0");
+  return `SA${num.slice(0, 2)}-${num.slice(2, 4)}-${num.slice(4)}`;
+}
+
+// ─── Violations ────────────────────────────────
+export function issueViolation(
+  targetUserId: string,
+  targetAccountId: string,
+  amount: number,
+  reason: string,
+  issuedBy: string,
+): Violation {
+  const db = loadDB();
+  const id = `VIO-${Date.now()}`;
+  const now = new Date();
+  const expires = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const v: Violation = {
+    id,
+    targetUserId,
+    targetAccountId,
+    amount,
+    reason,
+    status: "unpaid",
+    issuedBy,
+    issuedAt: now.toISOString(),
+    expiresAt: expires.toISOString(),
+  };
+  if (!db.violations) db.violations = [];
+  db.violations.push(v);
+  saveDB(db);
+  return v;
+}
+
+export function getViolationsByUserId(userId: string): Violation[] {
+  const db = loadDB();
+  return (db.violations ?? []).filter((v) => v.targetUserId === userId);
+}
+
+export function getUnpaidViolationsByUserId(userId: string): Violation[] {
+  return getViolationsByUserId(userId).filter((v) => v.status === "unpaid");
+}
+
+export function getAllViolations(limit = 25): Violation[] {
+  const db = loadDB();
+  const all = db.violations ?? [];
+  return all.slice(-limit).reverse();
+}
+
+export function payViolation(
+  violationId: string,
+  performedBy: string,
+): { success: boolean; error?: string } {
+  const db = loadDB();
+  if (!db.violations) db.violations = [];
+  const v = db.violations.find((x) => x.id === violationId);
+  if (!v) return { success: false, error: "المخالفة غير موجودة" };
+  if (v.status !== "unpaid") return { success: false, error: "المخالفة مسددة أو منتهية بالفعل" };
+  const account = Object.values(db.accounts).find((a) => a.userId === v.targetUserId);
+  if (!account) return { success: false, error: "لا يوجد حساب للمستخدم" };
+  if (account.balance < v.amount) return { success: false, error: "الرصيد غير كافٍ" };
+  account.balance -= v.amount;
+  v.status = "paid";
+  v.paidAt = new Date().toISOString();
+  db.transactions.push({
+    id: `${Date.now()}-vio-pay`,
+    type: "withdraw",
+    fromAccount: account.id,
+    amount: v.amount,
+    description: `تسديد مخالفة ${violationId}: ${v.reason}`,
+    timestamp: new Date().toISOString(),
+    performedBy,
+  });
+  saveDB(db);
+  return { success: true };
+}
+
+export function payAllViolations(
+  userId: string,
+  performedBy: string,
+): { paid: number; count: number; error?: string } {
+  const db = loadDB();
+  if (!db.violations) db.violations = [];
+  const account = Object.values(db.accounts).find((a) => a.userId === userId);
+  if (!account) return { paid: 0, count: 0, error: "لا يوجد حساب" };
+  const unpaid = db.violations.filter((v) => v.targetUserId === userId && v.status === "unpaid");
+  const total = unpaid.reduce((s, v) => s + v.amount, 0);
+  if (account.balance < total) return { paid: 0, count: 0, error: "الرصيد غير كافٍ لتسديد كل المخالفات" };
+  account.balance -= total;
+  const now = new Date().toISOString();
+  for (const v of unpaid) {
+    v.status = "paid";
+    v.paidAt = now;
+    db.transactions.push({
+      id: `${Date.now()}-${v.id}`,
+      type: "withdraw",
+      fromAccount: account.id,
+      amount: v.amount,
+      description: `تسديد مخالفة ${v.id}: ${v.reason}`,
+      timestamp: now,
+      performedBy,
+    });
+  }
+  saveDB(db);
+  return { paid: total, count: unpaid.length };
+}
+
+export function cancelViolation(
+  violationId: string,
+  cancelledBy: string,
+): { success: boolean; error?: string } {
+  const db = loadDB();
+  if (!db.violations) db.violations = [];
+  const v = db.violations.find((x) => x.id === violationId);
+  if (!v) return { success: false, error: "المخالفة غير موجودة" };
+  if (v.status === "cancelled") return { success: false, error: "المخالفة ملغاة بالفعل" };
+  v.status = "cancelled";
+  v.cancelledBy = cancelledBy;
+  saveDB(db);
+  return { success: true };
+}
+
+export function markExpiredViolations(): number {
+  const db = loadDB();
+  if (!db.violations) return 0;
+  const now = new Date();
+  let count = 0;
+  for (const v of db.violations) {
+    if (v.status === "unpaid" && new Date(v.expiresAt) < now) {
+      v.status = "evaded";
+      count++;
+    }
+  }
+  if (count > 0) saveDB(db);
+  return count;
 }
