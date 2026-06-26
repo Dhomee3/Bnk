@@ -44,6 +44,7 @@ import {
   payRoleSalaries,
   paySalaries,
   saveDB,
+  initDB,
   logRobbery,
   getRobberyLogs,
   deleteAccount,
@@ -1769,6 +1770,7 @@ async function handleButton(interaction: any) {
         { name: "🔴 ذخيرة / مخزن", value: `${w.ammo}`, inline: true },
         { name: "🔁 النوع", value: w.type, inline: true },
         { name: "⚖️ الوزن", value: w.weight, inline: true },
+        { name: "💵 التكلفة الإجمالية", value: `${w.cost.toLocaleString("en-US")}$`, inline: true },
         { name: "🔧 الموارد المطلوبة", value: recipeLines, inline: false },
         { name: canCraft ? "✅ يمكنك التصنيع" : "❌ حالة التصنيع", value: statusLines, inline: false },
       )
@@ -3022,6 +3024,7 @@ export async function startBot() {
     console.error("❌ DISCORD_BOT_TOKEN غير موجود!");
     return;
   }
+  await initDB();
   setupCronJobs();
   await client.login(token);
 }
