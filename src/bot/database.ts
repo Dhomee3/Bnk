@@ -195,12 +195,19 @@ export function getDB(): BotDB {
   return loadDB();
 }
 
+function cleanId(id: string): string {
+  return id.replace(/\s/g, "");
+}
+
 export function generateAccountNumber(): string {
   const db = loadDB();
-  const existing = Object.values(db.accounts).map((a) => parseInt(a.id));
-  let num = 1001;
-  while (existing.includes(num)) num++;
-  return num.toString();
+  const existing = new Set(Object.values(db.accounts).map((a) => a.id));
+  let id: string;
+  do {
+    const rand = Math.floor(Math.random() * 90000000) + 10000000;
+    id = "1" + rand.toString().slice(1);
+  } while (existing.has(id));
+  return id;
 }
 
 export function createAccount(
@@ -249,7 +256,7 @@ export function getAccountByUserId(userId: string): Account | null {
 
 export function getAccountById(accountId: string): Account | null {
   const db = loadDB();
-  return db.accounts[accountId] || null;
+  return db.accounts[cleanId(accountId)] || null;
 }
 
 export function transfer(
@@ -258,6 +265,8 @@ export function transfer(
   amount: number,
   performedBy: string
 ): { success: boolean; error?: string } {
+  fromId = cleanId(fromId);
+  toId = cleanId(toId);
   const db = loadDB();
   const from = db.accounts[fromId];
   const to = db.accounts[toId];
@@ -287,6 +296,7 @@ export function freezeAccount(
   freeze: boolean,
   performedBy: string
 ): boolean {
+  accountId = cleanId(accountId);
   const db = loadDB();
   if (!db.accounts[accountId]) return false;
   db.accounts[accountId].frozen = freeze;
@@ -367,6 +377,7 @@ export function setAccountBalance(
   performedBy: string,
   target: "bank" | "cash" = "bank"
 ): boolean {
+  accountId = cleanId(accountId);
   const db = loadDB();
   if (!db.accounts[accountId]) return false;
   const label = target === "cash" ? "كاش" : "بنك";
@@ -394,6 +405,7 @@ export function removeBalance(
   performedBy: string,
   target: "bank" | "cash" = "bank"
 ): { success: boolean; error?: string } {
+  accountId = cleanId(accountId);
   const db = loadDB();
   const account = db.accounts[accountId];
   if (!account) return { success: false, error: "الحساب غير موجود" };
@@ -423,6 +435,7 @@ export function deposit(
   amount: number,
   performedBy: string
 ): { success: boolean; error?: string } {
+  accountId = cleanId(accountId);
   const db = loadDB();
   const account = db.accounts[accountId];
   if (!account) return { success: false, error: "الحساب غير موجود" };
@@ -449,6 +462,7 @@ export function withdraw(
   amount: number,
   performedBy: string
 ): { success: boolean; error?: string } {
+  accountId = cleanId(accountId);
   const db = loadDB();
   const account = db.accounts[accountId];
   if (!account) return { success: false, error: "الحساب غير موجود" };
@@ -474,10 +488,12 @@ export function changeAccountId(
   newId: string,
   performedBy: string
 ): { success: boolean; error?: string } {
+  oldId = cleanId(oldId);
+  newId = cleanId(newId);
   const db = loadDB();
   if (!db.accounts[oldId]) return { success: false, error: "الحساب غير موجود" };
   if (db.accounts[newId]) return { success: false, error: "هذا الرقم مستخدم بالفعل" };
-  if (!/^\d{4}$/.test(newId)) return { success: false, error: "يجب أن يكون الإيبان 4 أرقام" };
+  if (!/^\d{8}$/.test(newId)) return { success: false, error: "يجب أن يكون الإيبان 8 أرقام" };
   const account = { ...db.accounts[oldId], id: newId };
   db.accounts[newId] = account;
   delete db.accounts[oldId];
@@ -616,6 +632,7 @@ export function deleteAccount(
   accountId: string,
   performedBy: string
 ): { success: boolean; error?: string } {
+  accountId = cleanId(accountId);
   const db = loadDB();
   if (!db.accounts[accountId]) return { success: false, error: "الحساب غير موجود" };
   const account = db.accounts[accountId];
