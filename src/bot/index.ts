@@ -298,7 +298,7 @@ client.once("clientReady", async (readyClient) => {
     activities: [
       {
         name: "Powered By FTRP .",
-        type: ActivityType.Streaming,
+        type: ActivityType.Playing,
       },
     ],
     status: "online",
